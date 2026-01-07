@@ -6,10 +6,13 @@ Wymagania: pip install reportlab qrcode pillow
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.utils import ImageReader
 import qrcode
 from io import BytesIO
-
+pdfmetrics.registerFont(TTFont("DejaVu Sans", "./DejaVuSans.ttf)"))
+pdfmetrics.registerFont(TTFont("DejaVu Sans-Bold", "./DejaVuSans-Bold.ttf)"))
 
 class SurveyPDFGenerator:
     def __init__(self, output_filename="ankieta_studencka.pdf"):
@@ -40,12 +43,12 @@ class SurveyPDFGenerator:
 
     def draw_header(self, c, y):
         """Rysuje nagłówek ankiety"""
-        c.setFont("Helvetica-Bold", 11)
+        c.setFont("DejaVu Sans-Bold", 11)
         title = "ANKIETA DLA STUDENTÓW OCENIAJĄCYCH PRZEDMIOTY I NAUCZYCIELI AKADEMICKICH"
         c.drawCentredString(self.width / 2, y, title)
         y -= 5 * mm
 
-        c.setFont("Helvetica", 8)
+        c.setFont("DejaVu Sans", 8)
         scale_text = "Skala: 1-zdecydowanie nie, 2-raczej nie, 3-trudno powiedzieć, 4-raczej tak, 5-zdecydowanie tak, 6-nie wiem"
         c.drawCentredString(self.width / 2, y, scale_text)
         y -= 6 * mm
@@ -55,7 +58,7 @@ class SurveyPDFGenerator:
     def draw_checkbox_row(self, c, x, y, question_text, question_num):
         """Rysuje wiersz z pytaniem i kratkami 1-6"""
         # Rysowanie pytania
-        c.setFont("Helvetica", 7)
+        c.setFont("DejaVu Sans", 7)
 
         # Podział tekstu na linie jeśli jest za długi
         max_width = self.usable_width - 35 * mm
@@ -65,7 +68,7 @@ class SurveyPDFGenerator:
 
         for word in words:
             test_line = current_line + " " + word if current_line else word
-            if c.stringWidth(test_line, "Helvetica", 7) < max_width:
+            if c.stringWidth(test_line, "DejaVu Sans", 7) < max_width:
                 current_line = test_line
             else:
                 if current_line:
@@ -95,15 +98,15 @@ class SurveyPDFGenerator:
             c.rect(box_x, box_y - box_size, box_size, box_size)
 
             # Rysowanie numeru nad kratką
-            c.setFont("Helvetica", 6)
+            c.setFont("DejaVu Sans", 6)
             c.drawCentredString(box_x + box_size / 2, box_y + 0.5 * mm, str(i))
-            c.setFont("Helvetica", 7)
+            c.setFont("DejaVu Sans", 7)
 
         return max(text_height, 4 * mm)
 
     def draw_closed_questions(self, c, y):
         """Rysuje część A - pytania zamknięte"""
-        c.setFont("Helvetica-Bold", 9)
+        c.setFont("DejaVu Sans-Bold", 9)
         c.drawString(self.margin, y, "CZĘŚĆ A: PYTANIA ZAMKNIĘTE")
         y -= 4 * mm
 
@@ -155,11 +158,11 @@ class SurveyPDFGenerator:
                 break
 
             # Rysowanie tytułu sekcji
-            c.setFont("Helvetica-Bold", 7)
+            c.setFont("DejaVu Sans-Bold", 7)
             c.drawString(self.margin, y, section_data['section'])
             y -= 3 * mm
 
-            c.setFont("Helvetica", 7)
+            c.setFont("DejaVu Sans", 7)
 
             # Rysowanie pytań w sekcji
             for item in section_data['items']:
@@ -178,7 +181,7 @@ class SurveyPDFGenerator:
         """Rysuje część B - pytania otwarte z QR kodami"""
         y -= 3 * mm
 
-        c.setFont("Helvetica-Bold", 9)
+        c.setFont("DejaVu Sans-Bold", 9)
         c.drawString(self.margin, y, "CZĘŚĆ B: PYTANIA OTWARTE")
         y -= 4 * mm
 
@@ -190,7 +193,7 @@ class SurveyPDFGenerator:
             'B5. Jakie elementy merytoryczne należałoby dodać do przedmiotu?'
         ]
 
-        c.setFont("Helvetica", 7)
+        c.setFont("DejaVu Sans", 7)
 
         box_height = 15 * mm
         qr_size = 12 * mm
@@ -237,7 +240,7 @@ class SurveyPDFGenerator:
         y = self.draw_open_questions(c, y)
 
         # Dodanie informacji w stopce (opcjonalnie)
-        c.setFont("Helvetica", 6)
+        c.setFont("DejaVu Sans", 6)
         footer_text = "Ankieta anonimowa - dziękujemy za wypełnienie"
         c.drawCentredString(self.width / 2, 10 * mm, footer_text)
 
