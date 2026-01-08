@@ -159,7 +159,7 @@ def draw_part_b(c, part_b_texts):
 
 
 def draw_foot(c,
-              content='Uwaga: Prosimy pisać drukowanymi literami w polach B i wyraźnie zaznaczać kratki w części A.'):
+              content='Uwaga: Prosimy pisać drukowanymi literami w polach B i wyraźnie zamalować kratki w części A.'):
     c.setFont(FONT_NAME, 7.5)
     c.setFillColor(colors.black)
     c.drawCentredString(PAGE_W / 2, MARGIN_B - 4 * mm + FIDUCIAL_SIZE, content)
