@@ -7,7 +7,7 @@ dependencies = [
     "opencv-python",
     "pytesseract",
     "pandas",
-    "Pillow",
+    "pillow",
     "pdf2image",
     "pyzbar",
     "openpyxl",
@@ -15,5 +15,6 @@ dependencies = [
     "reportlab",
     "qrcode",
     "reportlab-qrcode>=0.1.6",
+    "pandas-stubs~=2.3.3",
 ]
 

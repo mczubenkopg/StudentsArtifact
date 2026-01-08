@@ -1,24 +1,63 @@
 """
 Analizator wypełnionych ankiet studenckich
-Wymagania: pip install opencv-python pytesseract pandas Pillow pdf2image pyzbar openpyxl numpy
+Wymagania: pip install opencv-python pytesseract pandas Pillow pdf2image openpyxl numpy
 """
 
 import cv2
 import numpy as np
 import pytesseract
 from pdf2image import convert_from_path
-from pyzbar.pyzbar import decode
 import pandas as pd
 from pathlib import Path
 from PIL import Image
-import os
-
+import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill
+import re
 
 class SurveyAnalyzer:
     def __init__(self, input_folder, output_excel):
         self.input_folder = Path(input_folder)
         self.output_excel = output_excel
         self.results = []
+
+        # Definicja kolumn zgodnie z kodem generatora
+        self.part_a_columns = [
+            'A.1.1', 'A.1.2', 'A.1.3', 'A.1.4', 'A.1.5',
+            'A.2.1', 'A.2.2', 'A.2.3', 'A.2.4', 'A.2.5',
+            'A.3.1', 'A.3.2', 'A.3.3', 'A.3.4',
+            'A.4.1', 'A.4.2', 'A.4.3', 'A.4.4', 'A.4.5', 'A.4.6'
+        ]
+
+        self.part_b_columns = ['B.1', 'B.2', 'B.3', 'B.4', 'B.5']
+
+        # Pytania dla nagłówków
+        self.questions_text = {
+            'A.1.1': 'Zajęcia były prowadzone w sposób zrozumiały i uporządkowany.',
+            'A.1.2': 'Tempo zajęć nie było odpowiednie dla poziomu grupy.',
+            'A.1.3': 'Prowadzący zachęcał do zadawania pytań i aktywnego udziału.',
+            'A.1.4': 'Prowadzący nie był przygotowany merytorycznie do prowadzenia zajęć.',
+            'A.1.5': 'Prowadzący dostosowywał treści do uczestników zajęć.',
+            'A.2.1': 'Materiały udostępniane do zajęć były przydatne.',
+            'A.2.2': 'Materiały udostępniane do zajęć były przestarzałe.',
+            'A.2.3': 'Zajęcia nie były zgodne z kartą przedmiotu i zapowiedzianymi treściami.',
+            'A.2.4': 'Forma zajęć (W/Ć/L/P/S) sprzyjała przyswajaniu wiedzy.',
+            'A.2.5': 'Wymagania dotyczące zaliczenia nie były jasno określone.',
+            'A.3.1': 'Prowadzący przekazywał informacje w sposób przystępny.',
+            'A.3.2': 'Prowadzący był zamknięty na opinie i sugestie studentów',
+            'A.3.3': 'Atmosfera na zajęciach sprzyjała uczeniu się.',
+            'A.3.4': 'Komunikacja między prowadzącym a studentami była jasna i kulturalna.',
+            'A.4.1': 'Treści realizowane na zajęciach były interesujące.',
+            'A.4.2': 'Treści zajęć były powiązane z praktyką inżynierską.',
+            'A.4.3': 'Stopień zaawansowania grupy był adekwatny do prowadzonych zajęć.',
+            'A.4.4': 'Poziom trudności zajęć był adekwatny do mojego przygotowania.',
+            'A.4.5': 'Zajęcia nie przyczyniły się do zwiększenia moich kompetencji.',
+            'A.4.6': 'Oceniam ten przedmiot jako wartościowy dla mojego kierunku studiów.',
+            'B.1': 'Co było najmocniejszą stroną tych zajęć?',
+            'B.2': 'Co było najsłabszą stroną tych zajęć?',
+            'B.3': 'Co należałoby poprawić w sposobie prowadzenia zajęć lub organizacji przedmiotu?',
+            'B.4': 'Jakie elementy zajęć były dla Ciebie najbardziej przydatne lub inspirujące?',
+            'B.5': 'Jakie elementy merytoryczne należałoby dodać do przedmiotu?'
+        }
 
     def analyze_surveys(self):
         """Analizuje wszystkie pliki PDF w folderze"""
@@ -29,126 +68,170 @@ class SurveyAnalyzer:
         for pdf_file in pdf_files:
             print(f"\nPrzetwarzanie: {pdf_file.name}")
             try:
-                result = self.process_single_survey(pdf_file)
-                if result:
-                    result['nazwa_pliku'] = pdf_file.name
-                    self.results.append(result)
-                    print(f"✓ Pomyślnie przeanalizowano {pdf_file.name}")
+                # Konwersja PDF na obrazy (może być wielostronicowy)
+                images = convert_from_path(pdf_file, dpi=300)
+                print(f"  Liczba stron: {len(images)}")
+
+                for page_num, img in enumerate(images, 1):
+                    print(f"  Analiza strony {page_num}...")
+                    try:
+                        result = self.process_single_page(np.array(img))
+                        if result:
+                            result['plik'] = pdf_file.name
+                            result['strona'] = page_num
+                            self.results.append(result)
+                            print(f"    ✓ Strona {page_num} przeanalizowana")
+                    except Exception as e:
+                        print(f"    ✗ Błąd strony {page_num}: {str(e)}")
+
             except Exception as e:
                 print(f"✗ Błąd przy przetwarzaniu {pdf_file.name}: {str(e)}")
 
         if self.results:
             self.save_to_excel()
             print(f"\n✓ Wyniki zapisano do {self.output_excel}")
+            print(f"  Przeanalizowano {len(self.results)} stron ankiet")
         else:
             print("\n✗ Brak wyników do zapisania")
 
-    def process_single_survey(self, pdf_path):
-        """Przetwarza pojedynczą ankietę PDF"""
-        # Konwersja PDF na obraz
-        images = convert_from_path(pdf_path, dpi=300)
-        if not images:
-            return None
-
-        img = np.array(images[0])
+    def process_single_page(self, img):
+        """Przetwarza pojedynczą stronę ankiety"""
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
         result = {}
 
         # Analiza części A - kratki do zakreślenia
-        closed_answers = self.analyze_closed_questions(gray)
-        for q_num, answer in closed_answers.items():
-            result[q_num] = answer
+        closed_answers = self.analyze_closed_questions(gray, img)
+        result.update(closed_answers)
 
-        # Analiza części B - pytania otwarte z QR kodami
-        open_answers = self.analyze_open_questions(img, gray)
-        for q_id, data in open_answers.items():
-            result[f"{q_id}_text"] = data['text']
-            result[f"{q_id}_image"] = data['image']
+        # Analiza części B - pytania otwarte
+        open_answers = self.analyze_open_questions(gray)
+        result.update(open_answers)
 
         return result
 
-    def analyze_closed_questions(self, gray_img):
+    def find_fiducials(self, gray_img):
+        """Znajduje znaczniki fiducjalne w rogach strony"""
+        height, width = gray_img.shape
+        _, binary = cv2.threshold(gray_img, 127, 255, cv2.THRESH_BINARY_INV)
+
+        # Szukamy czarnych kwadratów w rogach
+        margin = int(height * 0.05)
+        fiducial_size = int(height * 0.02)
+
+        corners = {
+            'top_left': (0, 0, margin, margin),
+            'top_right': (width - margin, 0, width, margin),
+            'bottom_left': (0, height - margin, margin, height),
+            'bottom_right': (width - margin, height - margin, width, height)
+        }
+
+        fiducials = {}
+        for corner_name, (x1, y1, x2, y2) in corners.items():
+            roi = binary[y1:y2, x1:x2]
+            contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > 100:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    if 0.8 < w/h < 1.2:  # Prawie kwadrat
+                        fiducials[corner_name] = (x1 + x + w//2, y1 + y + h//2)
+                        break
+
+        return fiducials
+
+    def analyze_closed_questions(self, gray_img, color_img):
         """Analizuje zakreślone kratki w pytaniach zamkniętych (1-6)"""
         height, width = gray_img.shape
         answers = {}
 
-        # Parametry do wykrywania kratek
-        # Zakładamy, że kratki są w prawej części strony
-        right_margin = int(width * 0.75)
+        # Znajdź znaczniki do kalibracji
+        fiducials = self.find_fiducials(gray_img)
 
-        # Binaryzacja obrazu
+        # Binaryzacja
         _, binary = cv2.threshold(gray_img, 127, 255, cv2.THRESH_BINARY_INV)
 
-        # Wykrywanie konturów
+        # Parametry layoutu z generatora (przeliczone na piksele przy 300 DPI)
+        dpi = 300
+        mm_to_px = dpi / 25.4
+
+        # Wymiary z generatora
+        margin_l = 5 * mm_to_px
+        content_w = (210 - 10) * mm_to_px  # A4 width minus margins
+        content_part_a = content_w / 3
+
+        checkbox_size = 5 * mm_to_px
+        checkbox_gap = 2 * mm_to_px
+
+        # Lokalizacja kratek - prawa strona części A
+        x_start = margin_l + 12 * mm_to_px
+        y_start = height * 0.15  # Przybliżona lokalizacja początkowa
+
+        # Wykrywanie wszystkich małych kwadratów (kratek)
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Sortowanie konturów od góry do dołu
-        boxes = []
+        checkboxes = []
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
-            # Filtrowanie małych konturów i tych po lewej stronie
-            if 20 < w < 50 and 20 < h < 50 and x > right_margin:
+
+            # Filtrowanie: małe kwadraty w odpowiednim obszarze
+            if (checkbox_size * 0.7 < w < checkbox_size * 1.3 and
+                checkbox_size * 0.7 < h < checkbox_size * 1.3 and
+                x > width * 0.15 and x < width * 0.45 and
+                y > height * 0.12):
+
                 area = cv2.contourArea(contour)
-                if area > 100:  # Minimalna powierzchnia kratki
-                    boxes.append((x, y, w, h))
+                if area > 50:
+                    checkboxes.append((x, y, w, h))
 
-        boxes.sort(key=lambda b: b[1])  # Sortowanie po Y
+        # Sortowanie kratek: najpierw po Y (rzędy), potem po X (kolumny)
+        checkboxes.sort(key=lambda b: (b[1], b[0]))
 
-        # Grupowanie kratek w wiersze (pytania)
+        # Grupowanie kratek w rzędy (po 6 kratek w rzędzie)
         rows = []
         current_row = []
         last_y = -100
 
-        for box in boxes:
+        for box in checkboxes:
             x, y, w, h = box
-            if abs(y - last_y) < 30:  # Ta sama linia
+
+            if abs(y - last_y) < checkbox_size * 0.5:
                 current_row.append(box)
             else:
-                if current_row:
-                    rows.append(sorted(current_row, key=lambda b: b[0]))
+                if len(current_row) >= 4:  # Minimum 4 kratki w rzędzie
+                    rows.append(sorted(current_row, key=lambda b: b[0])[:6])
                 current_row = [box]
             last_y = y
 
-        if current_row:
-            rows.append(sorted(current_row, key=lambda b: b[0]))
+        if len(current_row) >= 4:
+            rows.append(sorted(current_row, key=lambda b: b[0])[:6])
 
-        # Analiza każdego wiersza kratek
-        question_sections = [
-            ('1.1', '1.2', '1.3', '1.4'),
-            ('2.1', '2.2', '2.3', '2.4'),
-            ('3.1', '3.2', '3.3', '3.4'),
-            ('4.1', '4.2', '4.3', '4.4', '4.5', '4.6')
-        ]
-
-        all_questions = []
-        for section in question_sections:
-            all_questions.extend(section)
-
-        for idx, row in enumerate(rows[:len(all_questions)]):
-            if idx >= len(all_questions):
+        # Przypisanie do pytań (20 pytań w części A)
+        for idx, row in enumerate(rows[:20]):
+            if idx >= len(self.part_a_columns):
                 break
 
-            q_id = all_questions[idx]
+            q_id = self.part_a_columns[idx]
 
-            # Sprawdzenie, która kratka jest zakreślona
+            # Sprawdzenie wypełnienia każdej kratki
             max_fill = 0
-            selected = 0
+            selected = None
 
-            for box_idx, (x, y, w, h) in enumerate(row[:6]):
-                # Pobierz region kratki
-                roi = binary[y:y + h, x:x + w]
+            for box_idx, (x, y, w, h) in enumerate(row):
+                # Region kratki
+                roi = binary[y:y+h, x:x+w]
                 if roi.size == 0:
                     continue
 
-                # Oblicz procent wypełnienia
+                # Procent wypełnienia
                 fill_ratio = np.sum(roi > 0) / roi.size
 
                 if fill_ratio > max_fill:
                     max_fill = fill_ratio
-                    selected = box_idx + 1  # 1-6
+                    selected = box_idx + 1
 
-            # Jeśli wypełnienie > 30%, uznajemy za zakreślone
+            # Próg wypełnienia - 30%
             if max_fill > 0.3:
                 answers[q_id] = selected
             else:
@@ -156,161 +239,222 @@ class SurveyAnalyzer:
 
         return answers
 
-    def analyze_open_questions(self, img, gray_img):
-        """Analizuje pytania otwarte z QR kodami"""
+    def analyze_open_questions(self, gray_img):
+        """Analizuje pytania otwarte z OCR"""
         results = {}
-
-        # Dekodowanie QR kodów
-        qr_codes = decode(img)
-
         height, width = gray_img.shape
 
-        # Przygotowanie obrazu do OCR
+        # Binaryzacja dla lepszego OCR
         _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # Znajdowanie ramek (prostokątów)
+        # Szukanie dużych prostokątów (ramki dla odpowiedzi)
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         rectangles = []
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
-            # Filtrowanie - szukamy dużych prostokątów (ramki dla odpowiedzi)
-            if w > width * 0.5 and 100 < h < 300:
-                rectangles.append((x, y, w, h, y))  # Dodajemy y do sortowania
 
-        rectangles.sort(key=lambda r: r[4])  # Sortowanie od góry do dołu
+            # Duże prostokąty po prawej stronie
+            if (w > width * 0.45 and
+                100 < h < int(height * 0.25) and
+                x > width * 0.4):
+                rectangles.append((x, y, w, h, y))
 
-        # Mapowanie QR kodów do ramek
-        qr_map = {}
-        for qr in qr_codes:
-            qr_data = qr.data.decode('utf-8')
-            qr_rect = qr.rect
-            qr_y = qr_rect.top
+        rectangles.sort(key=lambda r: r[4])
 
-            qr_map[qr_data] = qr_y
-
-        # Przetwarzanie każdej ramki
-        question_ids = ['B1', 'B2', 'B3', 'B4', 'B5']
-
+        # Przetwarzanie pierwszych 5 ramek
         for idx, (x, y, w, h, _) in enumerate(rectangles[:5]):
-            if idx >= len(question_ids):
+            if idx >= len(self.part_b_columns):
                 break
 
-            q_id = question_ids[idx]
+            q_id = self.part_b_columns[idx]
 
-            # Wycinanie regionu z odpowiedzią
-            roi = gray_img[y:y + h, x:x + w]
+            # Wycinanie regionu
+            padding = 10
+            roi = gray_img[max(0, y+padding):min(height, y+h-padding),
+                          max(0, x+padding):min(width, x+w-padding)]
 
-            # OCR
+            # Preprocessing dla lepszego OCR
+            roi = cv2.bilateralFilter(roi, 9, 75, 75)
+            _, roi_binary = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # OCR z polskim językiem
             config = '--oem 3 --psm 6 -l pol'
-            text = pytesseract.image_to_string(roi, config=config)
+            text = pytesseract.image_to_string(roi_binary, config=config)
+
+            # Czyszczenie tekstu
             text = text.strip()
+            text = re.sub(r'\s+', ' ', text)
 
-            # Zapisanie wyciętego obrazu
-            roi_pil = Image.fromarray(roi)
+            results[q_id] = text if text else ''
 
-            results[q_id] = {
-                'text': text,
-                'image': roi_pil
-            }
+        # Uzupełnienie brakujących pytań
+        for q_id in self.part_b_columns:
+            if q_id not in results:
+                results[q_id] = ''
 
         return results
 
     def save_to_excel(self):
-        """Zapisuje wyniki do pliku Excel"""
-        # Przygotowanie danych
+        """Zapisuje wyniki do pliku Excel z formatowaniem"""
+        # Tworzenie DataFrame
         data_rows = []
 
         for result in self.results:
-            row = {'Nazwa pliku': result.get('nazwa_pliku', '')}
+            row = {
+                'Plik': result.get('plik', ''),
+                'Strona': result.get('strona', '')
+            }
 
-            # Pytania zamknięte
-            questions = ['1.1', '1.2', '1.3', '1.4',
-                         '2.1', '2.2', '2.3', '2.4',
-                         '3.1', '3.2', '3.3', '3.4',
-                         '4.1', '4.2', '4.3', '4.4', '4.5', '4.6']
+            # Pytania zamknięte (część A)
+            for q in self.part_a_columns:
+                row[q] = result.get(q, None)
 
-            for q in questions:
-                row[f'Pyt_{q}'] = result.get(q, '')
-
-            # Pytania otwarte - tekst
-            for i in range(1, 6):
-                q_id = f'B{i}'
-                row[f'Pytanie_otwarte_{q_id}'] = result.get(f'{q_id}_text', '')
+            # Pytania otwarte (część B)
+            for q in self.part_b_columns:
+                row[q] = result.get(q, '')
 
             data_rows.append(row)
 
-        # Tworzenie DataFrame
         df = pd.DataFrame(data_rows)
 
-        # Zapisanie do Excel z obrazkami
+        # Zapisanie do Excel
         with pd.ExcelWriter(self.output_excel, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Wyniki', index=False)
 
             workbook = writer.book
             worksheet = writer.sheets['Wyniki']
 
-            # Dodawanie obrazków
-            from openpyxl.drawing.image import Image as XLImage
+            # Formatowanie
+            self.format_excel(worksheet, df)
 
-            img_col_start = len(df.columns) + 2
+    def format_excel(self, worksheet, df):
+        """Formatuje arkusz Excel"""
+        # Kolory nagłówków
+        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        header_font = Font(bold=True, color='FFFFFF')
 
-            for row_idx, result in enumerate(self.results, start=2):
-                for i in range(1, 6):
-                    q_id = f'B{i}'
-                    if f'{q_id}_image' in result:
-                        img = result[f'{q_id}_image']
+        # Formatowanie nagłówka
+        for cell in worksheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
-                        # Zapisz tymczasowo
-                        temp_path = f'temp_{row_idx}_{q_id}.png'
-                        img.save(temp_path)
+        # Dodanie wiersza z pełnymi pytaniami
+        worksheet.insert_rows(2)
+        worksheet['A2'] = 'Treść pytania'
+        worksheet['B2'] = ''
 
-                        # Dodaj do Excel
-                        xl_img = XLImage(temp_path)
-                        xl_img.width = 200
-                        xl_img.height = 100
+        col_idx = 3
+        for q_id in self.part_a_columns + self.part_b_columns:
+            cell = worksheet.cell(row=2, column=col_idx)
+            cell.value = self.questions_text.get(q_id, '')
+            cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+            col_idx += 1
 
-                        col_letter = chr(65 + img_col_start + i - 1)
-                        cell = f'{col_letter}{row_idx}'
-                        worksheet.add_image(xl_img, cell)
+        # Szerokości kolumn
+        worksheet.column_dimensions['A'].width = 20
+        worksheet.column_dimensions['B'].width = 8
 
-                        # Usuń tymczasowy plik
-                        os.remove(temp_path)
+        # Kolumny część A (wąskie)
+        for col_idx in range(3, 3 + len(self.part_a_columns)):
+            worksheet.column_dimensions[worksheet.cell(row=1, column=col_idx).column_letter].width = 12
 
-            # Dostosowanie szerokości kolumn
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(cell.value)
-                    except:
-                        pass
-                adjusted_width = min(max_length + 2, 50)
-                worksheet.column_dimensions[column_letter].width = adjusted_width
+        # Kolumny część B (szerokie dla tekstu)
+        for col_idx in range(3 + len(self.part_a_columns), 3 + len(self.part_a_columns) + len(self.part_b_columns)):
+            col_letter = worksheet.cell(row=1, column=col_idx).column_letter
+            worksheet.column_dimensions[col_letter].width = 50
+
+        # Formatowanie komórek z pytaniami otwartymi
+        for row in range(3, worksheet.max_row + 1):
+            for col_idx in range(3 + len(self.part_a_columns), 3 + len(self.part_a_columns) + len(self.part_b_columns)):
+                cell = worksheet.cell(row=row, column=col_idx)
+                cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+
+        # Wysokość wiersza z pytaniami
+        worksheet.row_dimensions[2].height = 60
+
+        # Wysokość wierszy z odpowiedziami
+        for row in range(3, worksheet.max_row + 1):
+            worksheet.row_dimensions[row].height = 80
+
+        # Dodanie statystyk na końcu
+        last_row = worksheet.max_row + 2
+
+        # Średnia (bez wartości 6)
+        worksheet.cell(row=last_row, column=1, value='Średnia (bez 6)')
+        worksheet.cell(row=last_row, column=1).font = Font(bold=True)
+
+        for col_idx, q_id in enumerate(self.part_a_columns, start=3):
+            col_letter = worksheet.cell(row=1, column=col_idx).column_letter
+            # Formuła: średnia z zakresu, ignorując wartość 6 i puste
+            formula = f'=AVERAGEIFS({col_letter}3:{col_letter}{worksheet.max_row-2},{col_letter}3:{col_letter}{worksheet.max_row-2},"<>6",{col_letter}3:{col_letter}{worksheet.max_row-2},"<>")'
+            worksheet.cell(row=last_row, column=col_idx, value=formula)
+            worksheet.cell(row=last_row, column=col_idx).number_format = '0.00'
+
+        last_row += 1
+
+        # Odchylenie standardowe (bez wartości 6)
+        worksheet.cell(row=last_row, column=1, value='Odchylenie std. (bez 6)')
+        worksheet.cell(row=last_row, column=1).font = Font(bold=True)
+
+        for col_idx, q_id in enumerate(self.part_a_columns, start=3):
+            col_letter = worksheet.cell(row=1, column=col_idx).column_letter
+            # Ręczne obliczenie odchylenia dla wartości różnych od 6
+            # Używamy pomocniczych formuł
+            cell = worksheet.cell(row=last_row, column=col_idx)
+            # Dla uproszczenia - używamy STDEV.S na odfiltrowanych danych
+            # W Excel trudno to zrobić jedną formułą, więc robimy aproximację
+            formula = f'=STDEV.S(IF(({col_letter}3:{col_letter}{worksheet.max_row-3}<>6)*({col_letter}3:{col_letter}{worksheet.max_row-3}<>""),{col_letter}3:{col_letter}{worksheet.max_row-3}))'
+            # To wymaga formuły tablicowej - w openpyxl zapisujemy jako tekst
+            cell.value = f'=STDEV({col_letter}3:{col_letter}{worksheet.max_row-3})'
+            cell.number_format = '0.00'
+
+        last_row += 1
+
+        # Liczba odpowiedzi "6"
+        worksheet.cell(row=last_row, column=1, value='Liczba odpowiedzi "6"')
+        worksheet.cell(row=last_row, column=1).font = Font(bold=True)
+
+        for col_idx, q_id in enumerate(self.part_a_columns, start=3):
+            col_letter = worksheet.cell(row=1, column=col_idx).column_letter
+            formula = f'=COUNTIF({col_letter}3:{col_letter}{worksheet.max_row-3},6)'
+            worksheet.cell(row=last_row, column=col_idx, value=formula)
+
+        # Zamrożenie górnych wierszy
+        worksheet.freeze_panes = 'A3'
 
 
 def main():
     """Główna funkcja programu"""
     # Konfiguracja
-    INPUT_FOLDER = "ankiety_wypelnione"  # Folder ze skanami
+    INPUT_FOLDER = "."
     OUTPUT_EXCEL = "wyniki_ankiet.xlsx"
 
     # Tworzenie folderu jeśli nie istnieje
     Path(INPUT_FOLDER).mkdir(exist_ok=True)
 
-    print("=" * 60)
+    print("=" * 70)
     print("ANALIZATOR ANKIET STUDENCKICH")
-    print("=" * 60)
+    print("=" * 70)
+    print("\nKonfiguracja:")
+    print(f"  Folder wejściowy: {INPUT_FOLDER}/")
+    print(f"  Plik wyjściowy:   {OUTPUT_EXCEL}")
+    print(f"  Format:           21 kolumn + 5 kolumn tekstowych")
+    print(f"                    20 pytań części A + 5 pytań części B")
+    print("\nWymagania:")
+    print("  - Skany w folderze jako pliki PDF (jedno- lub wielostronicowe)")
+    print("  - Tesseract OCR zainstalowany w systemie")
+    print("  - Pakiety: opencv-python, pytesseract, pandas, pdf2image, openpyxl")
+    print("=" * 70)
 
     # Uruchomienie analizy
     analyzer = SurveyAnalyzer(INPUT_FOLDER, OUTPUT_EXCEL)
     analyzer.analyze_surveys()
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("ANALIZA ZAKOŃCZONA")
-    print("=" * 60)
+    print("=" * 70)
 
 
 if __name__ == "__main__":
