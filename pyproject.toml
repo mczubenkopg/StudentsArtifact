@@ -3,7 +3,8 @@ name = "pythonproject1"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.14"
-dependencies = ["opencv-python",
+dependencies = [
+    "opencv-python",
     "pytesseract",
     "pandas",
     "Pillow",
@@ -12,5 +13,7 @@ dependencies = ["opencv-python",
     "openpyxl",
     "numpy",
     "reportlab",
-    "qrcode"]
+    "qrcode",
+    "reportlab-qrcode>=0.1.6",
+]
 
