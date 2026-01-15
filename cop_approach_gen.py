@@ -21,7 +21,7 @@ CONTENT_W = PAGE_W - 2 * MARGIN_L - 2 * MARGIN_R
 
 COL_GAP = 6 * mm
 TEXT_GAP = 2
-CHECKBOX_GAP = 2 * mm
+CHECKBOX_GAP = 2.5 * mm
 
 FONT_SIZE_LARGE = 12
 FONT_SIZE_NORMAL = 8
@@ -66,18 +66,24 @@ def draw_fiducials(c):
 
 def draw_title(c, questions=False, title='Ankieta studencka'):
     c.setFont(FONT_NAME, FONT_SIZE_LARGE)
-    c.drawCentredString(PAGE_W / 2, PAGE_H - MARGIN_T, title)
-    c.setFont(FONT_NAME, FONT_SIZE_NORMAL)
     if questions:
+        c.drawCentredString(PAGE_W / 2, PAGE_H - MARGIN_T, title)
+        c.setFont(FONT_NAME, FONT_SIZE_NORMAL)
         c.drawCentredString(X_A + CONTENT_W / 2, PAGE_H - MARGIN_T - 4 * mm - 12, 'Część A: Pytania zamknięte')
     else:
-        c.line(X_B - COL_GAP / 2, PAGE_H - MARGIN_T - MARGIN_B - TEXT_GAP, X_B - COL_GAP / 2, 2 * MARGIN_B)
-        c.drawCentredString(X_B + CONTENT_PART_B / 2, PAGE_H - MARGIN_T - 4 * mm - 12, 'Część B: Pytania otwarte')
+        c.drawString(X_A + 4, PAGE_H - MARGIN_T, title)
+        c.setFont(FONT_NAME, FONT_SIZE_NORMAL)
+        c.drawString(X_A+4, PAGE_H - MARGIN_T - 4 * mm - 4, 'Przedmiot i data: '+90*'..')
+        c.drawCentredString(X_A + CONTENT_PART_A / 2, PAGE_H - MARGIN_T - 4 * mm - 24, 'Część A: Pytania zamknięte')
+        c.line(X_B - COL_GAP / 2, PAGE_H - MARGIN_T - MARGIN_B - TEXT_GAP - 12, X_B - COL_GAP / 2, 2 * MARGIN_B)
+        c.drawCentredString(X_B + CONTENT_PART_B / 2, PAGE_H - MARGIN_T - 4 * mm - 24, 'Część B: Pytania otwarte')
+
     c.setFont(FONT_NAME, FONT_SIZE_SMALL)
     if questions:
         c.drawCentredString(X_A + CONTENT_W / 2, PAGE_H - MARGIN_T - 4 * mm - 24, '(zaznacz 1–6)  ')
     else:
-        c.drawCentredString(X_B + CONTENT_PART_B / 2, PAGE_H - MARGIN_T - 4 * mm - 24, '(wypełnij drukowanymi)  ')
+        c.drawCentredString(X_A + CONTENT_PART_A / 2, PAGE_H - MARGIN_T - 4 * mm - 36, '(zaznacz 1–6)  ')
+        c.drawCentredString(X_B + CONTENT_PART_B / 2, PAGE_H - MARGIN_T - 4 * mm - 36, '(wypełnij drukowanymi)  ')
 
 
 def draw_part_a(c, part_a_codes, scale_desc=None, draw_boxes=True):
@@ -91,7 +97,7 @@ def draw_part_a(c, part_a_codes, scale_desc=None, draw_boxes=True):
     box_dsc_y = Y_T - 28 * mm
     if draw_boxes:
         for i, text in enumerate(scale_desc):
-            cx = box_x + i * (CHECKBOX_SIZE + CHECKBOX_GAP) + CHECKBOX_SIZE / 2 + FONT_SIZE_NORMAL / 2 - 2
+            cx = box_x + i * (CHECKBOX_SIZE + CHECKBOX_GAP) + CHECKBOX_SIZE / 2 + FONT_SIZE_NORMAL / 2 - 2 + CHECKBOX_SIZE
             c.saveState()
             c.translate(cx, box_dsc_y)
             c.rotate(90)
@@ -110,7 +116,7 @@ def draw_part_a(c, part_a_codes, scale_desc=None, draw_boxes=True):
         c.drawString(x_0, y, name)
         y = y - FONT_SIZE_LARGE
         for code in codes:
-            bx = box_x
+            bx = box_x+CHECKBOX_SIZE
             by = y
             if draw_boxes:
                 # podpisy boxów i boxy
@@ -121,8 +127,13 @@ def draw_part_a(c, part_a_codes, scale_desc=None, draw_boxes=True):
                            fill=0)
                     c.drawCentredString(bx + i * (CHECKBOX_SIZE + CHECKBOX_GAP) + CHECKBOX_SIZE / 2, by + 2, str(i + 1))
             y = y - 1.25 * FONT_SIZE_SMALL
+
             c.setFont(FONT_NAME, FONT_SIZE_NORMAL)
-            c.drawString(x_0, y, code)
+            if draw_boxes:
+                QRCodeImage(code.strip('A').replace('.',''), size=CHECKBOX_SIZE+4*mm).drawOn(c, x_0+2*mm+CHECKBOX_SIZE, y-4*mm)
+                c.drawString(x_0, y, code)
+            else:
+                c.drawString(x_0, y, code)
             y = y - CHECKBOX_SIZE - CHECKBOX_GAP
 
 
@@ -250,7 +261,7 @@ A.2.4 Wykazywali umiejętność krytycznego myślenia.
 A.2.5 Umieli połączyć teorię z praktyką inżynierską.
 A.2.6 Studenci nadmiernie korzystali z LLM.'''.replace('\t', '').split(
             '\n')),
-        ('A.3 Kultura osobista', '''A.3.1 Grupa współpracowała w sposób konstruktywny.
+        ('A.3 Kultura osobista', '''A.3.1 Studenci współpracowali w sposób konstruktywny.
 A.3.2 Studenci wykazywali wzajemny szacunek i kulturę osobistą.		
 A.3.3 Komunikacja w grupie była przejrzysta i poprawna.
 A.3.4 Studenci respektowali zasady obowiązujące na zajęciach.'''.replace('\t',
@@ -260,17 +271,17 @@ A.3.4 Studenci respektowali zasady obowiązujące na zajęciach.'''.replace('\t'
 A.4.2 Jakość wykonania zadań była na zadowalającym poziomie.
 A.4.3 Studenci wykazywali kreatywność w rozwiązywaniu problemów.
 A.4.4 W pracach projektowych studenci potrafili dzielić się zadaniami.
-A.4.5 Całościowa postawa grupy była profesjonalna i odpowiedzialna.'''.replace(
+A.4.5 Całościowa postawa studentów była profesjonalna i odpowiedzialna.'''.replace(
             '\t', '').split('\n')),
 
     ]
 
     scale_desc = [
-        '1 – zdecyd. nie',
-        '2 – raczej nie',
-        '3 – trudno pow.',
-        '4 – raczej tak',
-        '5 – zdecyd. tak',
+        '1 – nikt',
+        '2 – kilkoro',
+        '3 – połowa',
+        '4 – większość',
+        '5 – wszyscy',
         '6 – bez odp.',
     ]
 
@@ -279,6 +290,8 @@ A.4.5 Całościowa postawa grupy była profesjonalna i odpowiedzialna.'''.replac
         'B.1. Jak oceniasz najmocniejsze strony tej grupy studenckiej?',
         'B.2. Jakie obszary wymagają poprawy lub dodatkowego wsparcia?',
         'B.3. Jakie działania dydaktyczne mogłyby pomóc w podniesieniu poziomu studentów?',
+        'B.4. Jaki jest ogólny poziom widzy grupy?',
+        'B.5. Jakie problemy nastąpiły podczas prowadzonych zajęć?'
     ]
     c = canvas.Canvas(filename, pagesize=A4)
     # Answers
