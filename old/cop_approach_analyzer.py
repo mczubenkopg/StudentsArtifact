@@ -358,4 +358,4 @@ def main(input_file='./20260108130546954.pdf', output_file='./wyniki.xlsx'):
     print(f"Zapisano wyniki do: {output_file}")
 
 if __name__ == '__main__':
-    main(input_file='./20260108130546954.pdf', output_file='./wyniki.xlsx')
+    main(input_file='./20260108130546954.pdf', output_file='../wyniki.xlsx')

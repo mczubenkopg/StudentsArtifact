@@ -1,20 +1,14 @@
 from copy import deepcopy
-from pathlib import Path
-from unittest import result
 
 import cv2
 import numpy as np
-import pytesseract
 from pdf2image import convert_from_path
-import pandas as pd
-from pyzbar.pyzbar import decode
 from pathlib import Path
-from PIL import Image, ImageDraw
-import openpyxl
-from openpyxl.styles import Alignment, Font, PatternFill
-from qreader import QReader
+from PIL import Image
 
-from image_tools import rectify_image
+from tools.checkbox_analyzer import analyse_checkboxes, draw_checkbox_debug
+from tools.image_tools import rectify_image
+from tools.qrcode_tools import decode_qrcodes
 
 
 class SingleResult:
@@ -92,7 +86,7 @@ def analyze_surveys():
             # PDF to images with 300 dpi
             images = convert_from_path(pdf_file, dpi=300)
             print(f"  Liczba stron: {len(images)}")
-            for page_num, img in enumerate(images[1:3]):
+            for page_num, img in enumerate(images[1:]):
                 print(f"  Analiza strony {page_num}...")
                 try:
                     result = process_single_page(img)
@@ -123,7 +117,7 @@ def process_single_page(page_img):
     # Analiza części A - kratki do zakreślenia
     page_img = rectify_image(np.array(page_img), dark_threshold=150, search_radius_frac=0.25)
 
-    codes_positions = find_qr_codes(page_img)
+    codes_positions = analyse_part_a(page_img)
 
     # # Analiza części B - pytania otwarte
     # open_answers = self.analyze_open_questions(gray)
@@ -132,50 +126,43 @@ def process_single_page(page_img):
     return result
 
 
-def find_qr_codes(page_img: np.ndarray, debug: bool = True):
+def analyse_part_a(page_img: np.ndarray, debug: bool = True):
     """Qr code finder"""
-    qreader = QReader(model_size='s', min_confidence=0.5) \
-        # Get the image that contains the QR code
     drawing_copy = deepcopy(page_img)
-    one_three = int(page_img.shape[1] / 3)
-
-    if debug:
-        cv2.line(drawing_copy, (one_three, 0), (one_three, page_img.shape[0]), (255, 255, 0), thickness=3)
+    one_three = int(0.35 * page_img.shape[1])
     cv_left_img = cv2.cvtColor(page_img[:, :one_three, :], cv2.COLOR_BGR2RGB)
     cv_right_img = cv2.cvtColor(page_img[:, one_three:, :], cv2.COLOR_BGR2RGB)
-    if debug:
-        limage = Image.fromarray(cv_left_img)
-        limage.show('LImage')
-        rimage = Image.fromarray(cv_right_img)
-        rimage.show('RImage')
 
-    b_codes = qreader.detect(image=cv_right_img)
-    b_codes_values = qreader.detect_and_decode(image=cv_right_img)
-    b_codes_final = {}
-    for text, val in zip(b_codes_values, b_codes):
-        bbox_xyxy = list(map(int, val.get('bbox_xyxy', [0,0,0,0])))
-        b_codes_final[text] = (one_three + bbox_xyxy[0], bbox_xyxy[1]), (one_three + bbox_xyxy[2], bbox_xyxy[3])
+
+    a_codes = decode_qrcodes(image=cv_left_img, expected_count=20)
+    for code in a_codes:
+        analysis = analyse_checkboxes(cv_left_img, code.bbox, gap_ratio=4.15/9, checkbox_size_ratio=7/9, mark_threshold=0.5)
         if debug:
-            cv2.rectangle(drawing_copy, *b_codes_final[text], (255, 0, 0), thickness=3)
+            drawing_copy = draw_checkbox_debug(drawing_copy, analysis)
+        #TODO rewrite code and anlysis
 
-    # print(b_codes_final)
+    b_codes = decode_qrcodes(image=cv_right_img, expected_count=5)
 
-    a_codes_final = {}
-    c_codes_values = qreader.detect_and_decode(image=cv_left_img)
-    print(c_codes_values)
-    pyzbar_out = decode(image=cv_left_img)
-    print(pyzbar_out)
-    for code in pyzbar_out:
-        name = code.data.decode("utf-8")
-        a_codes_final[name] = tuple(map(int, (code.polygon[0].x, code.polygon[0].y))), tuple(
-            map(int, (code.polygon[2].x, code.polygon[2].y)))
-        if debug:
-            cv2.rectangle(drawing_copy, *a_codes_final.get(name), (255, 0, 0), thickness=3)
+    # if debug:
+    #     for code in b_codes:
+    #         bbox = list(map(int, code.bbox))
+    #         bbox = (one_three + bbox[0], bbox[1]), (one_three + bbox[2], bbox[3])
+    #         cv2.rectangle(drawing_copy, *bbox, (255, 0, 0), thickness=3)
+    #
+    #     for code in a_codes:
+    #         bbox = list(map(int, code.bbox))
+    #         bbox = (bbox[0], bbox[1]), (bbox[2], bbox[3])
+    #         # print(code.enhancement, code.decoder)
+    #         cv2.rectangle(drawing_copy, *bbox, (255, 0, 0), thickness=3)
+
+    # fix the code and add parameter to analyse_checkboxes which is the average size (or fixed external) of the qr box. currently gap_ratio=4.15/9, checkbox_size_ratio=7/9 are the best parameters. change the default threshold value to 0.5, assume that there is only one boxchecked, thus analyse the whole line of the boxes and return only one check box
+
+    # basing on the position of qr codes extract the five lines of text from teh images, use the code that creates the textboxes. try to ocr the language assuming polish handwrite capitalics. as a result give the code name, cut box (ndarray) and recognized text
 
     if debug:
         image = Image.fromarray(drawing_copy)
         image.show('Image')
-    pass
+    return
 
 
 def save_to_excel(answers):
