@@ -62,6 +62,7 @@ class SingleResult:
         'A.4.1', 'A.4.2', 'A.4.3', 'A.4.4', 'A.4.5', 'A.4.6'
     ]
     part_b_column_names = ['B.1', 'B.2', 'B.3', 'B.4', 'B.5']
+
     def __init__(self):
         # Definicja kolumn zgodnie z kodem generatora
         self.part_a_answers = []
@@ -75,10 +76,9 @@ class SingleResult:
         pass
 
 
-
-
 INPUT_FOLDER = Path("./sample")
 OUTPUT_EXCEL = "wyniki_ankiet.xlsx"
+
 
 def analyze_surveys():
     """Analizuje wszystkie pliki PDF w folderze"""
@@ -92,11 +92,11 @@ def analyze_surveys():
             # PDF to images with 300 dpi
             images = convert_from_path(pdf_file, dpi=300)
             print(f"  Liczba stron: {len(images)}")
-            for page_num, img in enumerate(images[1:]):
+            for page_num, img in enumerate(images[1:3]):
                 print(f"  Analiza strony {page_num}...")
                 try:
                     result = process_single_page(img)
-                    #TODO
+                    # TODO
                     continue
                     if result:
                         result['plik'] = pdf_file.name
@@ -116,6 +116,7 @@ def analyze_surveys():
         print("\n✗ Brak wyników do zapisania")
     return results
 
+
 def process_single_page(page_img):
     """Przetwarza pojedynczą stronę ankiety"""
     result = SingleResult()
@@ -131,47 +132,55 @@ def process_single_page(page_img):
     return result
 
 
-
-def find_qr_codes(page_img:np.ndarray, debug:bool=True):
+def find_qr_codes(page_img: np.ndarray, debug: bool = True):
     """Qr code finder"""
-    qreader = QReader(model_size='s', min_confidence=0.5)\
-    # Get the image that contains the QR code
+    qreader = QReader(model_size='s', min_confidence=0.5) \
+        # Get the image that contains the QR code
     drawing_copy = deepcopy(page_img)
-    one_three = int(page_img.shape[0] / 3)
+    one_three = int(page_img.shape[1] / 3)
 
+    if debug:
+        cv2.line(drawing_copy, (one_three, 0), (one_three, page_img.shape[0]), (255, 255, 0), thickness=3)
     cv_left_img = cv2.cvtColor(page_img[:, :one_three, :], cv2.COLOR_BGR2RGB)
     cv_right_img = cv2.cvtColor(page_img[:, one_three:, :], cv2.COLOR_BGR2RGB)
-    # image = cv2.cvtColor(np.array(page_img)[:, :int(page_img.size[0] / 3), :], cv2.COLOR_BGR2RGB)
-
+    if debug:
+        limage = Image.fromarray(cv_left_img)
+        limage.show('LImage')
+        rimage = Image.fromarray(cv_right_img)
+        rimage.show('RImage')
 
     b_codes = qreader.detect(image=cv_right_img)
     b_codes_values = qreader.detect_and_decode(image=cv_right_img)
     b_codes_final = {}
     for text, val in zip(b_codes_values, b_codes):
-        b_codes_final[text] = val.get('bbox_xyxy')[:1], val.get('bbox_xyxy')[1:]
+        bbox_xyxy = list(map(int, val.get('bbox_xyxy', [0,0,0,0])))
+        b_codes_final[text] = (one_three + bbox_xyxy[0], bbox_xyxy[1]), (one_three + bbox_xyxy[2], bbox_xyxy[3])
         if debug:
             cv2.rectangle(drawing_copy, *b_codes_final[text], (255, 0, 0), thickness=3)
 
-    print(b_codes_final)
+    # print(b_codes_final)
 
     a_codes_final = {}
+    c_codes_values = qreader.detect_and_decode(image=cv_left_img)
+    print(c_codes_values)
     pyzbar_out = decode(image=cv_left_img)
     print(pyzbar_out)
     for code in pyzbar_out:
         name = code.data.decode("utf-8")
-        a_codes_final[name] = (code.polygon[0].x, code.polygon[0].y), (code.polygon[2].x, code.polygon[2].y)
+        a_codes_final[name] = tuple(map(int, (code.polygon[0].x, code.polygon[0].y))), tuple(
+            map(int, (code.polygon[2].x, code.polygon[2].y)))
         if debug:
             cv2.rectangle(drawing_copy, *a_codes_final.get(name), (255, 0, 0), thickness=3)
-
-
 
     if debug:
         image = Image.fromarray(drawing_copy)
         image.show('Image')
     pass
 
+
 def save_to_excel(answers):
     pass
+
 
 if __name__ == '__main__':
     analyze_surveys()

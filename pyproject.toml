@@ -16,5 +16,9 @@ dependencies = [
     "qrcode",
     "reportlab-qrcode>=0.1.6",
     "pandas-stubs~=2.3.3",
+    "scikit-learn>=1.8.0",
+    "matplotlib>=3.10.8",
+    "tqdm>=4.67.3",
+    "natural-pdf>=0.6.2",
 ]
 
