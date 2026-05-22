@@ -1,22 +1,16 @@
 """
 analyse_checkboxes.py
 ---------------------
-Locate and read 6 checkboxes that are arranged in a single horizontal
-line immediately to the right of a QR code.
+Locate and read 6 checkboxes arranged in a single horizontal line
+immediately to the right of a QR code, then return the single most-marked
+checkbox.
 
-Layout assumption (mirrors the PDF generator):
-  • The QR code and every checkbox have the same square side length.
-  • CHECKBOX_GAP between consecutive boxes equals half the box side.
-  • The checkbox row shares the same top edge as the QR code.
-  • Boxes are numbered 1-6 left-to-right, starting right after the QR code.
-
+Layout (mirrors the PDF generator):
   QR  | gap |  1  | gap |  2  | gap |  3  | gap |  4  | gap |  5  | gap |  6
 
-A checkbox is considered MARKED when its interior dark-pixel ratio
-exceeds `mark_threshold` (default 0.10 = 10 %).
-
-The QR code bounding box (x1, y1, x2, y2) is the only positional input
-required; all checkbox positions are derived from it.
+Exactly one checkbox is assumed to be marked.  The function scores every
+box by its interior dark-pixel ratio and returns the one with the highest
+score, provided it exceeds `mark_threshold` (default 0.50 = 50 %).
 
 Dependencies:
     pip install opencv-python-headless numpy
@@ -40,13 +34,14 @@ class CheckboxResult:
     Attributes
     ----------
     index : int
-        1-based checkbox number (1 … 6).
+        1-based checkbox number (1 … n).
     bbox : tuple[int, int, int, int]
         Bounding box (x1, y1, x2, y2) in image pixel coordinates.
     dark_ratio : float
         Fraction of interior pixels that are dark (0.0 – 1.0).
     marked : bool
-        True when dark_ratio >= mark_threshold.
+        True only for the single highest-scoring box when it exceeds
+        mark_threshold.
     """
     index: int
     bbox: tuple[int, int, int, int]
@@ -67,22 +62,25 @@ class CheckboxAnalysis:
     Attributes
     ----------
     checkboxes : list[CheckboxResult]
-        One entry per checkbox, always 6 items in index order.
+        One entry per checkbox in index order; exactly one has marked=True
+        when a clear winner is found.
     marked_index : int | None
-        1-based index of the marked checkbox, or None if none / ambiguous.
-    marked_count : int
-        Total number of checkboxes exceeding the mark threshold.
+        1-based index of the marked checkbox, or None if no box exceeds
+        mark_threshold.
     qr_bbox : tuple[int, int, int, int]
-        The QR code bbox that was used as the layout anchor.
+        The QR code bbox used as the layout anchor.
+    qr_side_px : int
+        The effective QR side length in pixels that was actually used
+        (either derived from qr_bbox or supplied via avg_qr_size_px).
     """
     checkboxes: list[CheckboxResult]
     marked_index: Optional[int]
-    marked_count: int
     qr_bbox: tuple[int, int, int, int]
+    qr_side_px: int
 
     def __repr__(self) -> str:
         return (f"CheckboxAnalysis(marked_index={self.marked_index}, "
-                f"marked_count={self.marked_count}, "
+                f"qr_side_px={self.qr_side_px}, "
                 f"checkboxes={self.checkboxes})")
 
 
@@ -97,10 +95,7 @@ def _to_gray(image: np.ndarray) -> np.ndarray:
 
 
 def _binarise(gray: np.ndarray) -> np.ndarray:
-    """
-    Produce a binary image where dark pixels = 255 (foreground).
-    Uses Otsu on the local region for robustness against lighting variation.
-    """
+    """Dark pixels → 255 (foreground), using global Otsu threshold."""
     _, binary = cv2.threshold(
         gray, 0, 255,
         cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
@@ -110,11 +105,9 @@ def _binarise(gray: np.ndarray) -> np.ndarray:
 
 def _dark_ratio(binary_roi: np.ndarray, shrink: float = 0.15) -> float:
     """
-    Compute the fraction of foreground (dark) pixels in the interior of
-    a pre-binarised ROI.
-
-    ``shrink`` removes a border of that fraction of the box width/height
-    to exclude the checkbox border stroke itself from the measurement.
+    Fraction of foreground (dark) pixels in the *interior* of a
+    pre-binarised ROI.  The border (``shrink`` × side) is stripped on
+    every edge to exclude the checkbox stroke from the measurement.
     """
     h, w = binary_roi.shape
     pad_x = max(1, int(w * shrink))
@@ -127,53 +120,37 @@ def _dark_ratio(binary_roi: np.ndarray, shrink: float = 0.15) -> float:
 
 def _checkbox_bboxes(
     qr_bbox: tuple[int, int, int, int],
-    n: int = 6,
-    gap_ratio: float = 0.5,
-    checkbox_size_ratio: float = 5 / 9,
+    qr_side_px: int,
+    n: int,
+    checkbox_size_ratio: float,
+    gap_ratio: float,
 ) -> list[tuple[int, int, int, int]]:
     """
-    Derive the n checkbox bounding boxes from the QR code bbox.
+    Derive n checkbox bounding boxes from the QR anchor and effective QR side.
 
-    Parameters
-    ----------
-    qr_bbox : (x1, y1, x2, y2)
-        QR code position in image pixels.
-    n : int
-        Number of checkboxes (default 6).
-    gap_ratio : float
-        Gap between boxes expressed as a fraction of the *checkbox* side.
-        Matches CHECKBOX_GAP = 0.5 × CHECKBOX_SIZE from the PDF generator.
-    checkbox_size_ratio : float
-        Checkbox side length as a fraction of the QR code side length.
-        Default 5/9 ≈ 0.556 (CHECKBOX_SIZE = 5 mm, QR ≈ 9 mm).
-        Checkboxes are centred vertically within the QR row.
-
-    Returns
-    -------
-    list of (x1, y1, x2, y2) for checkboxes 1 … n.
+    The checkbox side and gap are computed from ``qr_side_px`` (which may
+    differ from ``qr_bbox`` width when an external average size is supplied).
+    Checkboxes are centred vertically within the QR row height.
     """
     qx1, qy1, qx2, qy2 = qr_bbox
-    qr_side = qx2 - qx1
-    qr_h    = qy2 - qy1
+    qr_h = qy2 - qy1
 
-    cb_side = int(round(qr_side * checkbox_size_ratio))
-    gap     = int(round(cb_side * gap_ratio))
-    step    = cb_side + gap                      # left-edge advance per box
+    cb_side = int(round(qr_side_px * checkbox_size_ratio))
+    gap     = int(round(qr_side_px * gap_ratio))
+    step    = cb_side + gap
 
-    # Vertical centre alignment within the QR row
+    # Vertical centring within the QR row
     v_offset = (qr_h - cb_side) // 2
     cb_y1    = qy1 + v_offset
     cb_y2    = cb_y1 + cb_side
 
-    # First checkbox starts one gap to the right of the QR code
+    # Horizontal start: one gap to the right of the QR right edge
     first_x = qx2 + gap
 
-    bboxes = []
-    for i in range(n):
-        x1 = first_x + i * step
-        x2 = x1 + cb_side
-        bboxes.append((x1, cb_y1, x2, cb_y2))
-    return bboxes
+    return [
+        (first_x + i * step, cb_y1, first_x + i * step + cb_side, cb_y2)
+        for i in range(n)
+    ]
 
 
 # ── Public function ───────────────────────────────────────────────────────────
@@ -183,46 +160,55 @@ def analyse_checkboxes(
     qr_bbox: tuple[int, int, int, int],
     *,
     n: int = 6,
-    checkbox_size_ratio: float = 5 / 9,
-    gap_ratio: float = 0.5,
-    mark_threshold: float = 0.10,
+    checkbox_size_ratio: float = 7 / 9,
+    gap_ratio: float = 4.15 / 9,
+    mark_threshold: float = 0.50,
     shrink: float = 0.15,
+    avg_qr_size_px: Optional[int] = None,
 ) -> CheckboxAnalysis:
     """
-    Detect which of the ``n`` checkboxes next to a QR code is marked.
+    Find the single marked checkbox in a row of ``n`` boxes next to a QR code.
+
+    The function scores every checkbox by its interior dark-pixel ratio and
+    returns the one with the highest score.  Exactly one checkbox is assumed
+    to be filled; ``marked_index`` is None only when the best score is still
+    below ``mark_threshold``.
 
     Parameters
     ----------
     image : np.ndarray
         Full BGR (or grayscale) image of the scanned page.
     qr_bbox : tuple[int, int, int, int]
-        Bounding box of the QR code in image pixel coordinates (x1, y1, x2, y2).
-        Typically comes from ``fix_qrcode.decode_qrcodes()``:
-            ``result.bbox`` on the returned ``QRResult``.
+        Bounding box of the QR code (x1, y1, x2, y2) in image pixels.
+        Comes from ``fix_qrcode.decode_qrcodes()`` → ``QRResult.bbox``.
     n : int
         Number of checkboxes to analyse (default 6).
     checkbox_size_ratio : float
-        Checkbox side length as a fraction of the QR code side length.
-        Default 5/9 ≈ 0.556, matching CHECKBOX_SIZE = 5 mm against a
-        QR code of ≈ 9 mm as generated by the PDF layout code.
-        Checkboxes are centred vertically within the QR row.
+        Checkbox side as a fraction of the *effective* QR side.
+        Default 7/9 ≈ 0.778.
     gap_ratio : float
-        Gap between boxes as a fraction of the *checkbox* side (default 0.5).
-        Matches CHECKBOX_GAP = 2.5 mm, CHECKBOX_SIZE = 5 mm → ratio = 0.5.
+        Gap between consecutive boxes as a fraction of the *effective* QR side.
+        Default 4.15/9 ≈ 0.461.
     mark_threshold : float
-        Minimum dark-pixel fraction inside a checkbox interior to consider
-        it marked (default 0.10 = 10 %).
+        Minimum dark-pixel ratio in the interior of a checkbox to consider it
+        marked (default 0.50 = 50 %).  Only the highest-scoring box is ever
+        returned as marked; this threshold rules out fully empty pages.
     shrink : float
-        Border fraction stripped before measuring darkness, to exclude the
-        checkbox stroke itself (default 0.15 = 15 % on each side).
+        Border fraction stripped before measuring interior darkness, to exclude
+        the checkbox stroke (default 0.15 = 15 % per side).
+    avg_qr_size_px : int | None
+        When provided, overrides the QR side derived from ``qr_bbox`` and uses
+        this fixed pixel size instead.  Useful when the detected QR bbox is
+        noisy and you have a reliable average QR size from a calibration step
+        or from the rectified page geometry.
 
     Returns
     -------
     CheckboxAnalysis
-        ``.checkboxes``    – list of CheckboxResult, one per box (1-indexed)
-        ``.marked_index``  – 1-based index of the single marked box, or None
-        ``.marked_count``  – total number of marked boxes found
-        ``.qr_bbox``       – the anchor bbox that was used
+        ``.checkboxes``   – all n CheckboxResult objects in index order
+        ``.marked_index`` – 1-based index of the winning box, or None
+        ``.qr_bbox``      – the anchor bbox that was passed in
+        ``.qr_side_px``   – effective QR side that was used for geometry
 
     Raises
     ------
@@ -233,57 +219,46 @@ def analyse_checkboxes(
     if qx2 <= qx1 or qy2 <= qy1:
         raise ValueError(f"Degenerate qr_bbox: {qr_bbox}")
 
+    # Effective QR side: external average takes priority over detected width
+    qr_side_px: int = avg_qr_size_px if avg_qr_size_px is not None else (qx2 - qx1)
+
     img_h, img_w = image.shape[:2]
-    gray   = _to_gray(image)
+    binary = _binarise(_to_gray(image))
 
-    # Build one global binary for consistent thresholding across all boxes
-    binary = _binarise(gray)
+    bboxes = _checkbox_bboxes(qr_bbox, qr_side_px, n, checkbox_size_ratio, gap_ratio)
 
-    bboxes = _checkbox_bboxes(
-        qr_bbox,
-        n=n,
-        gap_ratio=gap_ratio,
-        checkbox_size_ratio=checkbox_size_ratio,
-    )
-    checkboxes: list[CheckboxResult] = []
-
+    scores: list[tuple[int, float, tuple[int, int, int, int]]] = []  # (idx, ratio, bbox)
     for idx, (x1, y1, x2, y2) in enumerate(bboxes, start=1):
-        # Clamp to image bounds
-        cx1 = max(0, x1)
-        cy1 = max(0, y1)
-        cx2 = min(img_w, x2)
-        cy2 = min(img_h, y2)
+        cx1, cy1 = max(0, x1), max(0, y1)
+        cx2, cy2 = min(img_w, x2), min(img_h, y2)
 
         if cx2 <= cx1 or cy2 <= cy1:
-            # Checkbox is outside the image — treat as empty
-            checkboxes.append(CheckboxResult(
-                index=idx,
-                bbox=(x1, y1, x2, y2),
-                dark_ratio=0.0,
-                marked=False,
-            ))
+            scores.append((idx, 0.0, (x1, y1, x2, y2)))
             continue
 
-        roi    = binary[cy1:cy2, cx1:cx2]
-        ratio  = _dark_ratio(roi, shrink=shrink)
-        marked = ratio >= mark_threshold
+        roi   = binary[cy1:cy2, cx1:cx2]
+        ratio = _dark_ratio(roi, shrink=shrink)
+        scores.append((idx, ratio, (x1, y1, x2, y2)))
 
-        checkboxes.append(CheckboxResult(
+    # Winner = single highest-scoring box
+    best_idx, best_ratio, _ = max(scores, key=lambda s: s[1])
+    winner_found = best_ratio >= mark_threshold
+
+    checkboxes = [
+        CheckboxResult(
             index=idx,
-            bbox=(x1, y1, x2, y2),
+            bbox=bbox,
             dark_ratio=ratio,
-            marked=marked,
-        ))
-
-    marked_boxes  = [cb for cb in checkboxes if cb.marked]
-    marked_count  = len(marked_boxes)
-    marked_index  = marked_boxes[0].index if marked_count == 1 else None
+            marked=(winner_found and idx == best_idx),
+        )
+        for idx, ratio, bbox in scores
+    ]
 
     return CheckboxAnalysis(
         checkboxes=checkboxes,
-        marked_index=marked_index,
-        marked_count=marked_count,
+        marked_index=best_idx if winner_found else None,
         qr_bbox=qr_bbox,
+        qr_side_px=qr_side_px,
     )
 
 
@@ -299,34 +274,26 @@ def draw_checkbox_debug(
     thickness: int = 2,
 ) -> np.ndarray:
     """
-    Return a copy of *image* with QR bbox and all checkbox bboxes drawn.
+    Return a copy of *image* with the QR bbox and all checkbox bboxes drawn.
 
-    Green  = marked checkbox
+    Green  = marked (winning) checkbox
     Grey   = empty checkbox
-    Orange = QR code anchor
+    Blue   = QR code anchor
     """
     out = image.copy() if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-    # Draw QR anchor
     qx1, qy1, qx2, qy2 = analysis.qr_bbox
     cv2.rectangle(out, (qx1, qy1), (qx2, qy2), colour_qr, thickness)
-
-    cv2.putText(out, f"{qx2-qx1}, {qy1-qy2}", (qx1, qy1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour_qr, 1)
+    cv2.putText(out, f"QR({analysis.qr_side_px}px)", (qx1, qy1 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, colour_qr, 1)
 
     for cb in analysis.checkboxes:
         colour = colour_marked if cb.marked else colour_empty
         x1, y1, x2, y2 = cb.bbox
         cv2.rectangle(out, (x1, y1), (x2, y2), colour, thickness)
-
-        # Index label above the box
-        label = str(cb.index)
-        cv2.putText(out, label, (x1 + 2, y1 - 4),
+        cv2.putText(out, str(cb.index), (x1 + 2, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1)
-
-        # Dark-ratio below the box
-        ratio_label = f"{cb.dark_ratio:.2f}"
-        cv2.putText(out, ratio_label, (x1 + 2, y2 + 12),
+        cv2.putText(out, f"{cb.dark_ratio:.2f}", (x1 + 2, y2 + 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1)
 
     return out
@@ -337,33 +304,35 @@ def draw_checkbox_debug(
 if __name__ == "__main__":
     import sys, pathlib
 
+    usage = (
+        "Usage: python analyse_checkboxes.py <image> <x1> <y1> <x2> <y2> "
+        "[avg_qr_size_px]\n"
+        "  x1 y1 x2 y2      = QR code bounding box in image pixels\n"
+        "  avg_qr_size_px    = override QR side length in pixels (optional)\n"
+    )
     if len(sys.argv) < 6:
-        print("Usage: python analyse_checkboxes.py <image> <x1> <y1> <x2> <y2> [cb_size_ratio]")
-        print("  x1 y1 x2 y2      = QR code bounding box in image pixels")
-        print("  cb_size_ratio     = checkbox side / QR side  (default 0.5556 = 5/9)")
+        print(usage)
         sys.exit(1)
 
-    path               = sys.argv[1]
-    qr_box             = tuple(int(v) for v in sys.argv[2:6])
-    cb_size_ratio      = float(sys.argv[6]) if len(sys.argv) > 6 else 5 / 9
+    path          = sys.argv[1]
+    qr_box        = tuple(int(v) for v in sys.argv[2:6])
+    avg_qr_size   = int(sys.argv[6]) if len(sys.argv) > 6 else None
 
     img = cv2.imread(path)
     if img is None:
         sys.exit(f"Cannot read image: {path}")
 
-    analysis = analyse_checkboxes(img, qr_box, checkbox_size_ratio=cb_size_ratio)
+    analysis = analyse_checkboxes(img, qr_box, avg_qr_size_px=avg_qr_size)
 
-    print(f"QR bbox            : {analysis.qr_bbox}")
-    print(f"Checkbox size ratio: {cb_size_ratio:.4f}")
-    print(f"Marked count       : {analysis.marked_count}")
-    print(f"Marked index       : {analysis.marked_index}")
+    print(f"QR bbox        : {analysis.qr_bbox}")
+    print(f"QR side used   : {analysis.qr_side_px} px")
+    print(f"Marked index   : {analysis.marked_index}")
     print()
     for cb in analysis.checkboxes:
         state = "✓ MARKED" if cb.marked else "  empty"
         print(f"  Checkbox {cb.index}: {state}  dark_ratio={cb.dark_ratio:.3f}  bbox={cb.bbox}")
 
-    # Save debug image
-    debug = draw_checkbox_debug(img, analysis)
+    debug    = draw_checkbox_debug(img, analysis)
     out_path = pathlib.Path(path).with_stem(pathlib.Path(path).stem + "_checkboxes")
     cv2.imwrite(str(out_path), debug)
     print(f"\nDebug image saved → {out_path}")

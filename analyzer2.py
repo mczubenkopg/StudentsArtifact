@@ -9,6 +9,7 @@ from PIL import Image
 from tools.checkbox_analyzer import analyse_checkboxes, draw_checkbox_debug
 from tools.image_tools import rectify_image
 from tools.qrcode_tools import decode_qrcodes
+from tools.textbox_anlyzer import extract_part_b_lines
 
 
 class SingleResult:
@@ -117,16 +118,12 @@ def process_single_page(page_img):
     # Analiza części A - kratki do zakreślenia
     page_img = rectify_image(np.array(page_img), dark_threshold=150, search_radius_frac=0.25)
 
-    codes_positions = analyse_part_a(page_img)
-
-    # # Analiza części B - pytania otwarte
-    # open_answers = self.analyze_open_questions(gray)
-    # result.update(open_answers)
+    part_a, part_b = analyse_content(page_img)
 
     return result
 
 
-def analyse_part_a(page_img: np.ndarray, debug: bool = True):
+def analyse_content(page_img: np.ndarray, debug: bool = True):
     """Qr code finder"""
     drawing_copy = deepcopy(page_img)
     one_three = int(0.35 * page_img.shape[1])
@@ -135,35 +132,51 @@ def analyse_part_a(page_img: np.ndarray, debug: bool = True):
 
 
     a_codes = decode_qrcodes(image=cv_left_img, expected_count=20)
+    avg_px = 38
     for code in a_codes:
-        analysis = analyse_checkboxes(cv_left_img, code.bbox, gap_ratio=4.15/9, checkbox_size_ratio=7/9, mark_threshold=0.5)
+        avg_px += ((code.bbox[2] - code.bbox[0]) + (code.bbox[3] - code.bbox[1]))/2
+    avg_px /= len(a_codes)+1
+    final_a_codes = {}
+    for code in a_codes:
+        analysis = analyse_checkboxes(cv_left_img, code.bbox, mark_threshold=0.15,
+                                      gap_ratio=3.3/9, avg_qr_size_px=avg_px)
         if debug:
             drawing_copy = draw_checkbox_debug(drawing_copy, analysis)
-        #TODO rewrite code and anlysis
+
+        final_a_codes[code.payload] = analysis
+
+    final_b_codes = {}
 
     b_codes = decode_qrcodes(image=cv_right_img, expected_count=5)
+    avg_px = 0
+    for code in b_codes:
+        avg_px += ((code.bbox[2] - code.bbox[0]) + (code.bbox[3] - code.bbox[1]))/2
+    avg_px /= len(b_codes)
+    for code in b_codes:
+        lines = extract_part_b_lines(cv_right_img, qr_bbox=code.bbox, avg_qr_size_px=avg_px)
+        #TODO
 
-    # if debug:
-    #     for code in b_codes:
-    #         bbox = list(map(int, code.bbox))
-    #         bbox = (one_three + bbox[0], bbox[1]), (one_three + bbox[2], bbox[3])
-    #         cv2.rectangle(drawing_copy, *bbox, (255, 0, 0), thickness=3)
-    #
-    #     for code in a_codes:
-    #         bbox = list(map(int, code.bbox))
-    #         bbox = (bbox[0], bbox[1]), (bbox[2], bbox[3])
-    #         # print(code.enhancement, code.decoder)
-    #         cv2.rectangle(drawing_copy, *bbox, (255, 0, 0), thickness=3)
-
-    # fix the code and add parameter to analyse_checkboxes which is the average size (or fixed external) of the qr box. currently gap_ratio=4.15/9, checkbox_size_ratio=7/9 are the best parameters. change the default threshold value to 0.5, assume that there is only one boxchecked, thus analyse the whole line of the boxes and return only one check box
-
-    # basing on the position of qr codes extract the five lines of text from teh images, use the code that creates the textboxes. try to ocr the language assuming polish handwrite capitalics. as a result give the code name, cut box (ndarray) and recognized text
-
+    print(lines)
     if debug:
         image = Image.fromarray(drawing_copy)
         image.show('Image')
-    return
+    return final_a_codes, final_b_codes
 
+
+"""
+
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from PIL import Image
+
+processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-handwritten")
+model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-handwritten")
+
+image = Image.open("roi.png").convert("RGB")
+pixel_values = processor(images=image, return_tensors="pt").pixel_values
+
+generated_ids = model.generate(pixel_values)
+text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+"""
 
 def save_to_excel(answers):
     pass
