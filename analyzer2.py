@@ -9,7 +9,7 @@ from PIL import Image
 from tools.checkbox_analyzer import analyse_checkboxes, draw_checkbox_debug
 from tools.image_tools import rectify_image
 from tools.qrcode_tools import decode_qrcodes
-from tools.textbox_anlyzer import extract_part_b_lines
+from tools.textbox_anlyzer import extract_text_from_bbox, draw_ocr_debug
 
 
 class SingleResult:
@@ -128,55 +128,58 @@ def analyse_content(page_img: np.ndarray, debug: bool = True):
     drawing_copy = deepcopy(page_img)
     one_three = int(0.35 * page_img.shape[1])
     cv_left_img = cv2.cvtColor(page_img[:, :one_three, :], cv2.COLOR_BGR2RGB)
-    cv_right_img = cv2.cvtColor(page_img[:, one_three:, :], cv2.COLOR_BGR2RGB)
+    cv_right_img = page_img[:, one_three:, :]
 
-
-    a_codes = decode_qrcodes(image=cv_left_img, expected_count=20)
-    avg_px = 38
-    for code in a_codes:
-        avg_px += ((code.bbox[2] - code.bbox[0]) + (code.bbox[3] - code.bbox[1]))/2
-    avg_px /= len(a_codes)+1
     final_a_codes = {}
-    for code in a_codes:
-        analysis = analyse_checkboxes(cv_left_img, code.bbox, mark_threshold=0.15,
-                                      gap_ratio=3.3/9, avg_qr_size_px=avg_px)
-        if debug:
-            drawing_copy = draw_checkbox_debug(drawing_copy, analysis)
-
-        final_a_codes[code.payload] = analysis
+    # a_codes = decode_qrcodes(image=cv_left_img, expected_count=20)
+    # avg_px = 38
+    # for code in a_codes:
+    #     avg_px += ((code.bbox[2] - code.bbox[0]) + (code.bbox[3] - code.bbox[1]))/2
+    # avg_px /= len(a_codes)+1
+    # for code in a_codes:
+    #     analysis = analyse_checkboxes(cv_left_img, code.bbox, mark_threshold=0.15,
+    #                                   gap_ratio=3.3/9, avg_qr_size_px=avg_px)
+    #     if debug:
+    #         drawing_copy = draw_checkbox_debug(drawing_copy, analysis)
+    #
+    #     final_a_codes[code.payload] = analysis
 
     final_b_codes = {}
-
-    b_codes = decode_qrcodes(image=cv_right_img, expected_count=5)
+    drawing_copy_right = deepcopy(cv_right_img)
+    b_codes = sorted(decode_qrcodes(image=cv_right_img, expected_count=5), key=lambda x: x.payload)
     avg_px = 0
     for code in b_codes:
         avg_px += ((code.bbox[2] - code.bbox[0]) + (code.bbox[3] - code.bbox[1]))/2
     avg_px /= len(b_codes)
-    for code in b_codes:
-        lines = extract_part_b_lines(cv_right_img, qr_bbox=code.bbox, avg_qr_size_px=avg_px)
-        #TODO
+    h, w, _ = cv_right_img.shape
+    for i in range(5):
+        if i!=4:
+            code_0, code_1 = b_codes[i:i+2]
+            frame_bbox = code_0.bbox[0] - int(avg_px / 4), code_0.bbox[1] - int(avg_px / 4), w - int(avg_px / 2), \
+                         code_1.bbox[1] - int(0.75 * avg_px)
+        else:
+            code_0 = b_codes[i]
+            frame_bbox = code_0.bbox[0] - int(avg_px / 4), code_0.bbox[1] - int(avg_px / 4), w - int(avg_px / 2), \
+                         h - int(0.75 * avg_px)
 
-    print(lines)
+        analysis = extract_text_from_bbox(cv_right_img, frame_bbox, engines=['rysocr'])
+        # change the code, use as a default engine tesseract(pol,--psm), add assumptions that text has only capital alphabet letters, no other digits or signs are used. add a model from https://huggingface.co/kacperwikiel/RysOCR to improve the text. add some dictionary method to match best words in polish
+        print(analysis)
+        drawing_copy_right = draw_ocr_debug(drawing_copy_right, analysis)
+
     if debug:
-        image = Image.fromarray(drawing_copy)
+        image = Image.fromarray(drawing_copy_right)
         image.show('Image')
     return final_a_codes, final_b_codes
 
-
+"""Act like professional python developer. 
+After that write a function "extract_text_from_bbox" that based on full image (np.ndarray) and bbox (x0, y0, x1,y1) -- roi will extract text in polish language using capitalise letters. 
+Use several different methods to extract text (running only offline without sending image to internet), not only tesseract.
+Among many use TrOCRProcessor, easyocr, doctr, rapidocr and more. You should use probably the image enhance methods.
+Merge the results into one merged text, take into account polish dictionary.   
+Add a graphical debug function for marking codes and text recognition.
 """
 
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-from PIL import Image
-
-processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-handwritten")
-model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-handwritten")
-
-image = Image.open("roi.png").convert("RGB")
-pixel_values = processor(images=image, return_tensors="pt").pixel_values
-
-generated_ids = model.generate(pixel_values)
-text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-"""
 
 def save_to_excel(answers):
     pass

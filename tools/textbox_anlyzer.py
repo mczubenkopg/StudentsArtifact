@@ -1,287 +1,1059 @@
 """
-extract_part_b.py
+text_extractor.py
 -----------------
-Extract and OCR the handwritten text lines from a Part-B answer box,
-using the QR code position and the PDF layout formula to locate each line.
+Extract handwritten / printed text from a region-of-interest (ROI) bbox in a
+scanned document image.
 
-Layout (from draw_part_b):
-  - box_h      = 45 mm
-  - qr_size    = 20 mm  (QR is placed 1pt below y_box_top)
-  - First line : y_box_top − 1 mm − 2×FONT_SIZE_LARGE (PDF coords)
-  - Line step  : 2×FONT_SIZE_LARGE points
-  - Lines overlapping the QR row start after the QR (left_pad);
-    lines below the QR span the full box width.
+Hard assumptions about the source text
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  • Only uppercase Latin + Polish letters (A–Z, Ą Ć Ę Ł Ń Ó Ś Ź Ż).
+  • No digits, punctuation, or special characters.
 
-For each line the function returns:
-  • code_name  – QR payload (e.g. "B.1")
-  • bbox       – (x1, y1, x2, y2) in original image pixels
-  • roi        – np.ndarray crop at original scale
-  • text       – OCR result (Polish, PSM 7 single-line)
+These assumptions drive three optimisations:
+  1. Tesseract is configured with a whitelist covering exactly those characters
+     and is used as the *primary* (always-on) engine.
+  2. All post-processing strips every character outside that alphabet.
+  3. The dictionary corrector only considers uppercase Polish words.
 
-Dependencies:
-    pip install opencv-python-headless pytesseract pyzbar
-    apt-get install tesseract-ocr tesseract-ocr-pol
+Engines (in priority order)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  1. Tesseract    – primary; always enabled; PSM 6 & 11; uppercase whitelist
+  2. RysOCR       – kacperwikiel/RysOCR LoRA on PaddleOCR-VL via PEFT;
+                    best available for Polish diacritics
+  3. EasyOCR      – secondary deep-learning engine (pl + en)
+  4. TrOCR        – microsoft/trocr-base-handwritten transformer
+  5. docTR        – document-understanding transformer pipeline
+  6. RapidOCR     – fast ONNX engine
+  7. PaddleOCR    – plain PaddleOCR without the LoRA (fallback)
+
+Image enhancement variants fed to every engine
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  raw | denoised | contrast_stretched | clahe | adaptive_bin | upscaled_sharp
+
+Merger & dictionary correction
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  All (engine × enhancement) candidates are:
+    1. Filtered to the uppercase Polish alphabet.
+    2. Scored with a Polish-coverage heuristic.
+    3. The winning candidate is post-processed word-by-word through a
+       Levenshtein-based closest-match lookup against a built-in Polish word
+       list (extended from morfologik-python when available).
+
+Debug
+~~~~~
+  draw_ocr_debug()       – annotate a single ROI on the page image
+  draw_multi_ocr_debug() – annotate several ROIs in one pass
+
+Dependencies (install what you need; missing engines are skipped silently):
+    pip install opencv-python-headless numpy pillow
+    pip install pytesseract                                  # + tesseract binary
+    pip install easyocr
+    pip install transformers torch torchvision peft          # RysOCR + TrOCR
+    pip install python-doctr[torch]                          # docTR
+    pip install rapidocr-onnxruntime
+    pip install paddlepaddle paddleocr                       # plain PaddleOCR
+    pip install morfologik-python                            # optional richer dict
 """
 
 from __future__ import annotations
 
+import re
+import unicodedata
+import warnings
+from dataclasses import dataclass, field
+from typing import Optional
+
 import cv2
 import numpy as np
-import pytesseract
-from dataclasses import dataclass
-from typing import Optional
-from pyzbar.pyzbar import decode as pyzbar_decode
+from PIL import Image
+
+warnings.filterwarnings("ignore")
 
 
-# ── PDF layout constants ──────────────────────────────────────────────────────
-_BOX_H_MM       = 45.0
-_QR_SIZE_MM     = 20.0
-_FONT_LARGE_PT  = 12.0          # FONT_SIZE_LARGE
-_LINE_STEP_PT   = 2 * _FONT_LARGE_PT   # 24 pt between lines
-_FIRST_LINE_MM  = 1.0           # gap from box top before first line
-_LEFT_PAD_PT    = 2.0           # pt gap between QR right edge and line start
-_LEFT_MARGIN_MM = 2.0           # mm from box left for lines below QR
-_RIGHT_MARGIN_MM = 3.0          # mm from box right
+# ── Character whitelist (the only characters we ever expect) ──────────────────
+
+# Uppercase base Latin + all uppercase Polish diacritics + space
+_ALLOWED_RE = re.compile(r"[^A-ZĄĆĘŁŃÓŚŹŻ ]", re.UNICODE)
+_TOKEN_RE   = re.compile(r"[A-ZĄĆĘŁŃÓŚŹŻ]+", re.UNICODE)
+
+# Tesseract character whitelist string (passed via config)
+_TESS_WHITELIST = "AĄBCĆDEĘFGHIJKLŁMNOÓPRQSŚTUVWXYZŹŻ "
 
 
-# ── Result dataclass ──────────────────────────────────────────────────────────
+# ── Optional engine imports ───────────────────────────────────────────────────
+
+try:
+    import pytesseract
+    HAS_TESSERACT = True
+except ImportError:
+    HAS_TESSERACT = False
+
+try:
+    import easyocr as _easyocr
+    _easyocr_reader: Optional[_easyocr.Reader] = None
+    HAS_EASYOCR = True
+except ImportError:
+    HAS_EASYOCR = False
+
+try:
+    from transformers import TrOCRProcessor, VisionEncoderDecoderModel, logging as _hf_log
+    import torch as _torch
+    _trocr_processor: Optional[TrOCRProcessor] = None
+    _trocr_model = None
+    HAS_TROCR = True
+except ImportError:
+    HAS_TROCR = False
+
+try:
+    from doctr.models import ocr_predictor as _doctr_predictor_factory
+    from doctr.io import DocumentFile as _DocFile
+    _doctr_model = None
+    HAS_DOCTR = True
+except ImportError:
+    HAS_DOCTR = False
+
+try:
+    from rapidocr_onnxruntime import RapidOCR as _RapidOCR
+    _rapid_engine: Optional[_RapidOCR] = None
+    HAS_RAPIDOCR = True
+except ImportError:
+    HAS_RAPIDOCR = False
+
+try:
+    from paddleocr import PaddleOCR as _PaddleOCR
+    _paddle_engine: Optional[_PaddleOCR] = None
+    HAS_PADDLEOCR = True
+except ImportError:
+    HAS_PADDLEOCR = False
+
+# RysOCR: PaddleOCR-VL base + kacperwikiel/RysOCR LoRA adapter
+try:
+    from peft import PeftModel as _PeftModel
+    from transformers import (
+        AutoProcessor as _AutoProcessor,
+        AutoModelForCausalLM as _AutoModelForCausalLM,
+    )
+    _rysocr_model = None
+    _rysocr_processor = None
+    HAS_RYSOCR = True
+except ImportError:
+    HAS_RYSOCR = False
+
+
+# ── Public data classes ───────────────────────────────────────────────────────
 
 @dataclass
-class LineResult:
+class EngineResult:
     """
-    One extracted text line from a Part-B answer box.
+    Raw OCR output from a single engine × enhancement combination.
 
     Attributes
     ----------
-    code_name : str
-        QR code payload used as the section identifier (e.g. ``"B.1"``).
-    line_index : int
-        1-based line number within the box.
-    bbox : tuple[int, int, int, int]
-        (x1, y1, x2, y2) of the strip in original image pixel coordinates.
-    roi : np.ndarray
-        Cropped image of the strip at original scale (BGR).
+    engine : str
+        Name of the OCR engine (e.g. 'tesseract_psm6', 'rysocr').
+    enhancement : str
+        Name of the image enhancement applied (e.g. 'clahe', 'upscaled_sharp').
     text : str
-        OCR result; empty string when the line is blank.
+        Raw text returned by the engine (may still contain noise before
+        the alphabet filter is applied in the merger).
+    confidence : float
+        Engine-reported confidence in [0, 1] where available; else -1.
     """
-    code_name: str
-    line_index: int
-    bbox: tuple[int, int, int, int]
-    roi: np.ndarray
+    engine: str
+    enhancement: str
     text: str
+    confidence: float = -1.0
 
     def __repr__(self) -> str:
-        return (f"LineResult(code={self.code_name!r}, line={self.line_index}, "
-                f"bbox={self.bbox}, text={self.text!r})")
+        preview = self.text[:60].replace("\n", "↵")
+        return (f"EngineResult(engine={self.engine!r}, "
+                f"enhancement={self.enhancement!r}, "
+                f"confidence={self.confidence:.2f}, "
+                f"text={preview!r})")
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
-
-def _detect_qr(image: np.ndarray) -> Optional[tuple[str, tuple[int, int, int, int]]]:
+@dataclass
+class OCRAnalysis:
     """
-    Detect the first QR code in *image* and return (payload, xyxy_bbox).
-    Uses pyzbar; returns None when nothing is found.
+    Full result returned by ``extract_text_from_bbox``.
+
+    Attributes
+    ----------
+    merged_text : str
+        Final best-scoring text after filtering, merging, and dictionary
+        correction.  Contains only uppercase Polish letters and spaces.
+    corrected_text : str
+        Word-by-word dictionary-corrected version of merged_text.
+    roi_bbox : tuple[int, int, int, int]
+        The ROI bounding box passed in (x0, y0, x1, y1).
+    engine_results : list[EngineResult]
+        All raw results from every (engine × enhancement) combination.
+    best_engine : str
+        Engine that produced the winning pre-correction candidate.
+    best_enhancement : str
+        Enhancement that produced the winning pre-correction candidate.
+    polish_score : float
+        Heuristic Polish-dictionary coverage score of the merged text.
     """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    hits = pyzbar_decode(gray)
-    if not hits:
-        return None
-    obj = hits[0]
-    r = obj.rect
-    bbox = (r.left, r.top, r.left + r.width, r.top + r.height)
-    return obj.data.decode("utf-8", errors="replace"), bbox
+    merged_text: str
+    corrected_text: str
+    roi_bbox: tuple[int, int, int, int]
+    engine_results: list[EngineResult] = field(default_factory=list)
+    best_engine: str = ""
+    best_enhancement: str = ""
+    polish_score: float = 0.0
+
+    def __repr__(self) -> str:
+        preview = self.corrected_text[:80].replace("\n", "↵")
+        return (f"OCRAnalysis(corrected_text={preview!r}, "
+                f"best_engine={self.best_engine!r}, "
+                f"polish_score={self.polish_score:.3f})")
 
 
-def _find_outer_box(image: np.ndarray) -> tuple[int, int, int, int]:
-    """
-    Find the largest rectangle (outer answer box) in the image.
-    Returns (x1, y1, x2, y2).
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        h, w = image.shape[:2]
-        return 0, 0, w, h
-    largest = max(contours, key=cv2.contourArea)
-    x, y, bw, bh = cv2.boundingRect(largest)
-    return x, y, x + bw, y + bh
+# ── Polish word dictionary ────────────────────────────────────────────────────
+# Seeded with high-frequency words + vocabulary from the sample survey forms.
+# At module import time we attempt to extend it from morfologik-python.
+
+_POLISH_DICT: set[str] = {
+    # Prepositions / conjunctions / particles
+    "W", "Z", "I", "NA", "DO", "SIĘ", "NIE", "TO", "JE", "GO", "A",
+    "ZE", "PO", "TE", "TAM", "TEN", "TEJ", "TAK", "CO", "JAK", "OD",
+    "ALE", "CZY", "BY", "ZA", "WE", "LUB", "GDY", "BO", "TU", "JUŻ",
+    "JEJ", "ICH", "PAN", "ONI", "ONA", "ONO", "ORAZ", "PRZEZ", "PRZY",
+    "JAKO", "JEST", "SĄ", "BYŁ", "BYŁA", "BYŁO", "BĘDZIE",
+    # Survey-form domain words
+    "OTWARTOŚĆ", "PROWADZĄCEGO", "KORYGOWANIE", "WYPOWIEDZI", "PISEMNYCH",
+    "STUDENTÓW", "ZWRACANIE", "UWAGĘ", "CZĘSTO", "WYSTĘPUJĄCE", "BŁĘDY",
+    "DUŻO", "INFORMACJI", "TEORETYCZNYCH", "ZWIĄZANYCH", "NAUKĄ",
+    "JĘZYKU", "JĘZYKA", "GRAMATYKĄ", "GRAMATYCZNĄ", "GRAMATYCZNEJ",
+    "WIEDZY", "ZACHĘCAĆ", "BARDZIEJ", "TWORZENIA", "WŁASNYCH",
+    "PISANIA", "PRACY", "ANALIZA", "TEKSTÓW", "POPULARNONAUKOWYCH",
+    "UDOSTĘPNIANYCH", "TWORZENIE", "FORMALNYM", "STYLU", "STYLEM",
+    "ZWRÓCIĆ", "WIĘKSZĄ", "POPULARNE", "INTERPUNKCYJNE", "JĘZYKOWE",
+    "POPEŁNIANE", "ZAANGAŻOWANIA", "GRUPY", "PRÓBA", "ZWIĘKSZENIA",
+    "ZAINTERESOWANIA", "ELEMENTÓW", "MERYTORYCZNYCH", "NALEŻAŁOBY",
+    "DODAĆ", "PRZEDMIOTU", "ZAJĘĆ", "SPOSOBIE", "POPRAWIĆ",
+    "NAJMOCNIEJSZĄ", "NAJSŁABSZĄ", "STRONĘ", "STRON", "STRONĄ",
+    "PRZYDATNE", "INSPIRUJĄCE", "NAJBARDZIEJ", "ILOŚĆ",
+    "PRZEKAZYWANEJ", "ZMNIEJSZYĆ", "PROWADZENIA", "ORGANIZACJI",
+    "ZAINTERESOWANIE", "ZAINTERESOWANIA", "BRAKU", "BRAK",
+    "PRZYDATNYCH", "INFORMACJI", "ELEMENTY", "ELEMENTY",
+    "POPULARNONAUKOWYCH", "UDOSTĘPNIANYCH", "WYPOWIEDZI",
+    # General Polish vocabulary
+    "PRACA", "NAUKA", "JĘZYK", "TEKST", "SŁOWO", "ZDANIE", "FORMA",
+    "WIEDZA", "ĆWICZENIA", "PRZYKŁADY", "METODA", "TEMAT", "KURS",
+    "ZAJĘCIA", "STUDENT", "PROWADZĄCY", "PRZEDMIOT", "OCENA",
+    "OPIS", "ANALIZA", "WSTĘP", "KONIEC", "MATERIAŁ", "MATERIAŁY",
+    "TREŚĆ", "TREŚCI", "ZADANIE", "ZADANIA", "PYTANIE", "PYTANIA",
+    "ODPOWIEDŹ", "ODPOWIEDZI", "CZĘŚĆ", "SEKCJA", "STRONA",
+    "UWAGI", "KOMENTARZ", "KOMENTARZE", "WYNIK", "WYNIKI",
+}
+
+# Attempt to bulk-load morfologik-python's Polish wordlist
+try:
+    import morfologik  # type: ignore
+    _morph = morfologik.Analyzer()
+    # morfologik does not expose a word list directly; we enrich the dict lazily
+    # via _morph.analyse(word) during correction instead.
+    HAS_MORFOLOGIK = True
+except Exception:
+    HAS_MORFOLOGIK = False
+    _morph = None
 
 
-def _preprocess_for_ocr(roi_bgr: np.ndarray, scale: float = 2.0) -> np.ndarray:
-    """
-    Upscale, sharpen, and binarise a colour ROI for Tesseract.
-    Returns a single-channel binary image (dark text = 0, background = 255).
-    """
-    up = cv2.resize(roi_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
-    sharp = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
-    _, binary = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return binary
+def _is_polish_word(word: str) -> bool:
+    """Return True if *word* (uppercase) is a valid Polish word."""
+    if word in _POLISH_DICT:
+        return True
+    if HAS_MORFOLOGIK and _morph is not None:
+        try:
+            results = _morph.analyse(word.lower())
+            if results:
+                _POLISH_DICT.add(word)  # cache for next call
+                return True
+        except Exception:
+            pass
+    return False
 
 
-def _ocr_line(roi_bgr: np.ndarray, lang: str = "pol") -> str:
+# ── Polish scoring heuristics ─────────────────────────────────────────────────
+
+_POLISH_PATTERNS: list[re.Pattern] = [
+    re.compile(p, re.UNICODE) for p in [
+        r"[ĄĆĘŁŃÓŚŹŻ]",           # Polish diacritics present
+        r"OWAĆ$|YWAĆ$",            # infinitive endings
+        r"ENIA$|ANIE$|IENIE$",     # nominal endings
+        r"NYCH$|OWEJ$|OWEGO$",     # genitive adjective endings
+        r"ÓW$|OM$|AMI$",           # plural endings
+    ]
+]
+
+
+def _polish_coverage(text: str) -> float:
     """
-    Run Tesseract on a single line ROI.
-    Tries PSM 7 (single line) and PSM 8 (single word) and returns the
-    longer result, which tends to be more complete for handwriting.
+    Heuristic score [0, 1] measuring how well a text matches Polish uppercase.
+
+    Combines:
+      • fraction of tokens found in the Polish dictionary
+      • presence of Polish diacritic characters
+      • matches against common Polish morphological patterns
+      • token-length distribution (Polish words average 6–8 letters)
     """
-    binary = _preprocess_for_ocr(roi_bgr)
-    cfg7 = f"--oem 3 --psm 7 -l {lang}"
-    cfg8 = f"--oem 3 --psm 8 -l {lang}"
-    t7 = pytesseract.image_to_string(binary, config=cfg7).strip()
-    t8 = pytesseract.image_to_string(binary, config=cfg8).strip()
-    return t7 if len(t7) >= len(t8) else t8
+    if not text or not text.strip():
+        return 0.0
+    upper = text.upper().strip()
+    tokens = _TOKEN_RE.findall(upper)
+    if not tokens:
+        return 0.0
+
+    word_score      = sum(1 for t in tokens if _is_polish_word(t)) / len(tokens)
+    diacritic_score = min(1.0, sum(1 for ch in upper if ch in "ĄĆĘŁŃÓŚŹŻ") / max(1, len(tokens)))
+    pattern_score   = min(1.0,
+        sum(1 for p in _POLISH_PATTERNS if any(p.search(t) for t in tokens))
+        / len(_POLISH_PATTERNS)
+    )
+    avg_len      = float(np.mean([len(t) for t in tokens]))
+    length_score = min(1.0, avg_len / 7.0)
+
+    return (
+        0.40 * word_score
+        + 0.25 * diacritic_score
+        + 0.20 * pattern_score
+        + 0.15 * length_score
+    )
+
+
+# ── Polish dictionary corrector ───────────────────────────────────────────────
+
+def _levenshtein(a: str, b: str) -> int:
+    """Classic dynamic-programming Levenshtein distance."""
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i] + [0] * lb
+        for j, cb in enumerate(b, 1):
+            curr[j] = min(
+                prev[j] + 1,
+                curr[j - 1] + 1,
+                prev[j - 1] + (0 if ca == cb else 1),
+            )
+        prev = curr
+    return prev[lb]
+
+
+def _closest_polish_word(token: str, max_distance: int = 2) -> str:
+    """
+    Return the closest word in _POLISH_DICT to *token* (uppercase).
+
+    Returns *token* unchanged when:
+      • an exact match exists, or
+      • all dictionary candidates are farther than *max_distance*.
+
+    Short tokens (≤ 2 letters) are never substituted to avoid false positives.
+    """
+    if len(token) <= 2 or _is_polish_word(token):
+        return token
+
+    best_word  = token
+    best_dist  = max_distance + 1
+
+    # Only compare against same-length ± 2 words for speed
+    target_len = len(token)
+    candidates = [
+        w for w in _POLISH_DICT
+        if abs(len(w) - target_len) <= 2
+    ]
+
+    for candidate in candidates:
+        d = _levenshtein(token, candidate)
+        if d < best_dist:
+            best_dist = d
+            best_word = candidate
+            if d == 1:
+                break  # close enough; stop early
+
+    return best_word
+
+
+def _correct_text(text: str) -> str:
+    """
+    Apply word-by-word dictionary correction to *text* (uppercase Polish).
+
+    Only substitutes a token when a strictly closer dictionary word is found
+    within Levenshtein distance 2.  Tokens already in the dictionary or
+    shorter than 3 characters are left untouched.
+    """
+    if not text:
+        return text
+    corrected_tokens: list[str] = []
+    for token in text.split():
+        corrected_tokens.append(_closest_polish_word(token))
+    return " ".join(corrected_tokens)
+
+
+# ── Text normalisation ────────────────────────────────────────────────────────
+
+def _filter_to_alphabet(text: str) -> str:
+    """
+    Strip every character outside the uppercase Polish alphabet + space.
+
+    Multiple spaces are collapsed; the result is stripped of leading/trailing
+    whitespace.
+    """
+    if not text:
+        return ""
+    upper = unicodedata.normalize("NFC", text).upper()
+    filtered = _ALLOWED_RE.sub(" ", upper)
+    filtered = re.sub(r" {2,}", " ", filtered)
+    return filtered.strip()
+
+
+# ── Image enhancement pipelines ──────────────────────────────────────────────
+
+def _to_gray(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return image
+    if image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+
+def _enhance_raw(roi: np.ndarray) -> np.ndarray:
+    return _to_gray(roi)
+
+
+def _enhance_denoised(roi: np.ndarray) -> np.ndarray:
+    gray = _to_gray(roi)
+    return cv2.fastNlMeansDenoising(gray, h=12, templateWindowSize=7, searchWindowSize=21)
+
+
+def _enhance_contrast_stretched(roi: np.ndarray) -> np.ndarray:
+    gray = _to_gray(roi)
+    mn, mx = int(gray.min()), int(gray.max())
+    if mx == mn:
+        return gray
+    return ((gray.astype(np.float32) - mn) / (mx - mn) * 255).clip(0, 255).astype(np.uint8)
+
+
+def _enhance_clahe(roi: np.ndarray) -> np.ndarray:
+    gray = _to_gray(roi)
+    return cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+
+
+def _enhance_adaptive_bin(roi: np.ndarray) -> np.ndarray:
+    gray    = _to_gray(roi)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    return cv2.adaptiveThreshold(
+        blurred, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 15, 8,
+    )
+
+
+def _enhance_upscaled_sharp(roi: np.ndarray) -> np.ndarray:
+    gray  = _to_gray(roi)
+    h, w  = gray.shape
+    big   = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+    blur  = cv2.GaussianBlur(big, (0, 0), 3)
+    return cv2.addWeighted(big, 1.6, blur, -0.6, 0)
+
+
+_ENHANCEMENTS: list[tuple[str, callable]] = [
+    ("raw",                _enhance_raw),
+    ("denoised",           _enhance_denoised),
+    ("contrast_stretched", _enhance_contrast_stretched),
+    ("clahe",              _enhance_clahe),
+    ("adaptive_bin",       _enhance_adaptive_bin),
+    ("upscaled_sharp",     _enhance_upscaled_sharp),
+]
+
+
+# ── Engine runners ────────────────────────────────────────────────────────────
+# Every runner returns list[EngineResult].  Errors are silently swallowed so
+# that one broken engine never aborts the whole pipeline.
+
+# --- Tesseract (primary / always-on) ----------------------------------------
+
+def _run_tesseract(enhanced: np.ndarray, enhancement_name: str) -> list[EngineResult]:
+    """
+    Primary engine.  Three PSM configurations tuned for uppercase-only text:
+      PSM 6  – assume a single uniform block of text
+      PSM 11 – sparse text, finds as much text as possible
+      PSM 7  – single text line (useful for short boxes)
+
+    The character whitelist restricts Tesseract to the allowed alphabet so no
+    digit / punctuation noise can enter the output.
+    """
+    if not HAS_TESSERACT:
+        return []
+
+    results: list[EngineResult] = []
+    whitelist_cfg = f"-c tessedit_char_whitelist={_TESS_WHITELIST}"
+    configs = [
+        ("pol", f"--psm 6  --oem 3 {whitelist_cfg}"),
+        ("pol", f"--psm 11 --oem 3 {whitelist_cfg}"),
+        ("pol", f"--psm 7  --oem 3 {whitelist_cfg}"),
+    ]
+    pil_img = Image.fromarray(enhanced)
+    for lang, cfg in configs:
+        try:
+            raw  = pytesseract.image_to_string(pil_img, lang=lang, config=cfg)
+            data = pytesseract.image_to_data(
+                pil_img, lang=lang, config=cfg,
+                output_type=pytesseract.Output.DICT,
+            )
+            confs = [c for c in data["conf"] if isinstance(c, (int, float)) and c != -1]
+            conf  = float(np.mean(confs)) / 100.0 if confs else -1.0
+            text  = raw.strip()
+            if text:
+                psm = re.search(r"--psm\s+(\d+)", cfg)
+                label = f"tesseract_psm{psm.group(1) if psm else '?'}({lang})"
+                results.append(EngineResult(
+                    engine=label,
+                    enhancement=enhancement_name,
+                    text=text,
+                    confidence=conf,
+                ))
+        except Exception:
+            pass
+    return results
+
+
+# --- RysOCR (Polish LoRA on PaddleOCR-VL) ------------------------------------
+
+_RYSOCR_PROMPT = (
+    "Transcribe every word in this image exactly as written. "
+    "Output only the transcribed text in uppercase Polish. "
+    "Use only capital letters A-Z and Polish diacritics Ą Ć Ę Ł Ń Ó Ś Ź Ż. "
+    "No punctuation, no digits, no explanations."
+)
+
+
+def _load_rysocr() -> bool:
+    """Lazy-load RysOCR (base model + LoRA) into module-level singletons."""
+    global _rysocr_model, _rysocr_processor
+    if _rysocr_model is not None:
+        return True
+    if not HAS_RYSOCR:
+        return False
+    try:
+        _hf_log.set_verbosity_error()
+        base = _AutoModelForCausalLM.from_pretrained(
+            "PaddlePaddle/PaddleOCR-VL",
+            trust_remote_code=True,
+        )
+        _rysocr_model = _PeftModel.from_pretrained(base, "kacperwikiel/RysOCR")
+        _rysocr_model.eval()
+        _rysocr_processor = _AutoProcessor.from_pretrained(
+            "PaddlePaddle/PaddleOCR-VL",
+            trust_remote_code=True,
+        )
+        _hf_log.set_verbosity_warning()
+        return True
+    except Exception:
+        _rysocr_model = None
+        _rysocr_processor = None
+        return False
+
+
+def _run_rysocr(enhanced: np.ndarray, enhancement_name: str) -> list[EngineResult]:
+    """
+    RysOCR engine: PaddleOCR-VL base fine-tuned with a Polish LoRA adapter.
+    Excels at correct diacritic restoration (ą/ę/ł/ó misread by other engines).
+    Only runs on the 'raw' and 'clahe' enhancements to avoid redundant inference.
+    """
+    if not HAS_RYSOCR:
+        return []
+    # Limit to 2 enhancements for this heavier model
+    if enhancement_name not in ("raw", "clahe"):
+        return []
+    if not _load_rysocr():
+        return []
+    try:
+        import torch
+        if enhanced.ndim == 2:
+            rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb).convert("RGB")
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil_img},
+                    {"type": "text",  "text": _RYSOCR_PROMPT},
+                ],
+            }
+        ]
+        inputs = _rysocr_processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            output_ids = _rysocr_model.generate(
+                **inputs,
+                max_new_tokens=256,
+                do_sample=False,
+            )
+        text = _rysocr_processor.decode(output_ids[0], skip_special_tokens=True).strip()
+        # Strip everything before the last assistant turn marker if present
+        if "\nassistant\n" in text.lower():
+            text = text.split("\nassistant\n")[-1].strip()
+        if text:
+            return [EngineResult(
+                engine="rysocr",
+                enhancement=enhancement_name,
+                text=text,
+                confidence=-1.0,
+            )]
+    except Exception:
+        pass
+    return []
+
+
+# --- EasyOCR -----------------------------------------------------------------
+
+def _run_easyocr(enhanced: np.ndarray, enhancement_name: str) -> list[EngineResult]:
+    if not HAS_EASYOCR:
+        return []
+    global _easyocr_reader
+    try:
+        if _easyocr_reader is None:
+            _easyocr_reader = _easyocr.Reader(["pl", "en"], gpu=False, verbose=False)
+        detections = _easyocr_reader.readtext(enhanced, detail=1, paragraph=False)
+        if not detections:
+            return []
+        lines: list[str] = []
+        confs: list[float] = []
+        for _bbox, txt, conf in detections:
+            if txt.strip():
+                lines.append(txt.strip())
+                confs.append(float(conf))
+        text     = " ".join(lines)
+        avg_conf = float(np.mean(confs)) if confs else -1.0
+        if text:
+            return [EngineResult(engine="easyocr", enhancement=enhancement_name,
+                                 text=text, confidence=avg_conf)]
+    except Exception:
+        pass
+    return []
+
+
+# --- TrOCR -------------------------------------------------------------------
+
+def _run_trocr(enhanced: np.ndarray, enhancement_name: str) -> list[EngineResult]:
+    if not HAS_TROCR:
+        return []
+    global _trocr_processor, _trocr_model
+    try:
+        if _trocr_processor is None:
+            _hf_log.set_verbosity_error()
+            _trocr_processor = TrOCRProcessor.from_pretrained(
+                "microsoft/trocr-base-handwritten"
+            )
+            _trocr_model = VisionEncoderDecoderModel.from_pretrained(
+                "microsoft/trocr-base-handwritten",
+                ignore_mismatched_sizes=True,
+            )
+            _trocr_model.eval()
+            _hf_log.set_verbosity_warning()
+
+        if enhanced.ndim == 2:
+            rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb).convert("RGB")
+
+        pixel_values = _trocr_processor(images=pil_img, return_tensors="pt").pixel_values
+        with _torch.no_grad():
+            generated_ids = _trocr_model.generate(pixel_values)
+        text = _trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        if text:
+            return [EngineResult(engine="trocr", enhancement=enhancement_name,
+                                 text=text, confidence=-1.0)]
+    except Exception:
+        pass
+    return []
+
+
+# --- docTR -------------------------------------------------------------------
+
+def _run_doctr(enhanced: np.ndarray, enhancement_name: str) -> list[EngineResult]:
+    if not HAS_DOCTR:
+        return []
+    global _doctr_model
+    try:
+        if _doctr_model is None:
+            _doctr_model = _doctr_predictor_factory(pretrained=True)
+        if enhanced.ndim == 2:
+            rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
+        doc = _DocFile.from_images([rgb])
+        result = _doctr_model(doc)
+        lines: list[str] = []
+        for page in result.pages:
+            for block in page.blocks:
+                for line in block.lines:
+                    words = [w.value for w in line.words if w.value.strip()]
+                    if words:
+                        lines.append(" ".join(words))
+        text = "\n".join(lines).strip()
+        if text:
+            return [EngineResult(engine="doctr", enhancement=enhancement_name,
+                                 text=text, confidence=-1.0)]
+    except Exception:
+        pass
+    return []
+
+
+# --- RapidOCR ----------------------------------------------------------------
+
+def _run_rapidocr(enhanced: np.ndarray, enhancement_name: str) -> list[EngineResult]:
+    if not HAS_RAPIDOCR:
+        return []
+    global _rapid_engine
+    try:
+        if _rapid_engine is None:
+            _rapid_engine = _RapidOCR()
+        result, _ = _rapid_engine(enhanced)
+        if not result:
+            return []
+        lines: list[str] = []
+        confs: list[float] = []
+        for item in result:
+            txt  = item[1].strip() if len(item) > 1 else ""
+            conf = float(item[2])  if len(item) > 2 else -1.0
+            if txt:
+                lines.append(txt)
+                confs.append(conf)
+        text     = " ".join(lines)
+        avg_conf = float(np.mean(confs)) if confs else -1.0
+        if text:
+            return [EngineResult(engine="rapidocr", enhancement=enhancement_name,
+                                 text=text, confidence=avg_conf)]
+    except Exception:
+        pass
+    return []
+
+
+# --- PaddleOCR (plain, no LoRA) ----------------------------------------------
+
+def _run_paddleocr(enhanced: np.ndarray, enhancement_name: str) -> list[EngineResult]:
+    if not HAS_PADDLEOCR:
+        return []
+    global _paddle_engine
+    try:
+        if _paddle_engine is None:
+            _paddle_engine = _PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+        result = _paddle_engine.ocr(enhanced, cls=True)
+        if not result or not result[0]:
+            return []
+        lines: list[str] = []
+        confs: list[float] = []
+        for item in result[0]:
+            txt  = item[1][0].strip() if item[1] else ""
+            conf = float(item[1][1])  if item[1] else -1.0
+            if txt:
+                lines.append(txt)
+                confs.append(conf)
+        text     = " ".join(lines)
+        avg_conf = float(np.mean(confs)) if confs else -1.0
+        if text:
+            return [EngineResult(engine="paddleocr", enhancement=enhancement_name,
+                                 text=text, confidence=avg_conf)]
+    except Exception:
+        pass
+    return []
+
+
+# Engine registry — Tesseract is first and always-on
+_ENGINE_RUNNERS: list[tuple[str, callable]] = [
+    ("tesseract", _run_tesseract),
+    ("rysocr",    _run_rysocr),
+    ("easyocr",   _run_easyocr),
+    ("trocr",     _run_trocr),
+    ("doctr",     _run_doctr),
+    ("rapidocr",  _run_rapidocr),
+    ("paddleocr", _run_paddleocr),
+]
+
+
+# ── Candidate merger ──────────────────────────────────────────────────────────
+
+def _merge_candidates(results: list[EngineResult]) -> tuple[str, str, str, float]:
+    """
+    Select the best text from all (engine × enhancement) candidates.
+
+    Steps
+    -----
+    1. Apply alphabet filter to every candidate.
+    2. Score with _polish_coverage().
+    3. Apply a length penalty for candidates below 60 % of the longest.
+    4. Add a small confidence bonus where available.
+    5. Tesseract and RysOCR results receive a 0.05 priority boost.
+
+    Returns
+    -------
+    (merged_text, best_engine, best_enhancement, best_score)
+    """
+    if not results:
+        return "", "", "", 0.0
+
+    # Priority boost for our preferred engines
+    _PRIORITY_ENGINES = {"tesseract_psm6(pol)", "tesseract_psm11(pol)",
+                         "tesseract_psm7(pol)", "rysocr"}
+
+    filtered: list[tuple[EngineResult, str, float]] = []
+    for er in results:
+        text  = _filter_to_alphabet(er.text)
+        score = _polish_coverage(text)
+        filtered.append((er, text, score))
+
+    max_len = max((len(t) for _, t, _ in filtered), default=1)
+    max_len = max(max_len, 1)
+
+    scored: list[tuple[float, EngineResult, str]] = []
+    for er, text, cov in filtered:
+        length_ratio  = len(text) / max_len
+        length_penalty = 0.0 if length_ratio >= 0.6 else (length_ratio - 0.6) * 1.5
+        conf_bonus    = er.confidence * 0.05 if er.confidence >= 0 else 0.0
+        priority_bonus = 0.05 if any(er.engine.startswith(e) for e in _PRIORITY_ENGINES) else 0.0
+        total = cov + length_penalty + conf_bonus + priority_bonus
+        scored.append((total, er, text))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_er, best_text = scored[0]
+    return best_text, best_er.engine, best_er.enhancement, best_score
 
 
 # ── Public function ───────────────────────────────────────────────────────────
 
-def extract_part_b_lines(
+def extract_text_from_bbox(
     image: np.ndarray,
-    qr_bbox: Optional[tuple[int, int, int, int]] = None,
-    qr_payload: Optional[str] = None,
+    roi_bbox: tuple[int, int, int, int],
     *,
-    avg_qr_size_px: Optional[int] = None,
-    n_lines: int = 5,
-    lang: str = "pol",
-    strip_pad_above: float = 0.12,
-    strip_pad_below: float = 0.80,
-) -> list[LineResult]:
+    engines: Optional[list[str]] = None,
+    enhancements: Optional[list[str]] = None,
+    mark_threshold: float = 0.0,
+    apply_dictionary_correction: bool = True,
+) -> OCRAnalysis:
     """
-    Extract and OCR the ``n_lines`` handwritten text lines from a Part-B
-    answer box, using the QR code position as a geometric anchor.
+    Extract uppercase Polish text from a rectangular region of a scanned page.
+
+    The input text is assumed to consist **exclusively** of uppercase Latin and
+    Polish letters (A–Z, Ą Ć Ę Ł Ń Ó Ś Ź Ż).  Digits, punctuation, and any
+    other characters are stripped from every candidate before scoring.
+
+    Tesseract (PSM 6 / 11 / 7, ``pol`` language, uppercase whitelist) is the
+    primary engine and always runs.  The RysOCR LoRA model, EasyOCR, TrOCR,
+    docTR, RapidOCR, and PaddleOCR are used as supplementary engines when
+    installed.
+
+    After the best raw candidate is selected it is optionally post-processed
+    with a Levenshtein-based Polish dictionary corrector that replaces
+    obviously mis-read tokens with the closest known Polish word.
 
     Parameters
     ----------
     image : np.ndarray
-        Full scanned page image (BGR).
-    qr_bbox : (x1, y1, x2, y2) | None
-        QR code bounding box in image pixels.  When None the function
-        auto-detects the first QR code in the image using pyzbar.
-    qr_payload : str | None
-        QR code payload used as ``code_name`` in results.  Auto-detected
-        when ``qr_bbox`` is None; must be supplied when ``qr_bbox`` is given
-        manually.
-    avg_qr_size_px : int | None
-        Override the QR side length used for geometry (pixels).  Useful when
-        the detected bbox is noisy.  When None the side is taken from qr_bbox.
-    n_lines : int
-        Number of text lines to extract (default 5, matching the PDF layout).
-    lang : str
-        Tesseract language string (default ``"pol"`` for Polish).
-    strip_pad_above : float
-        Fraction of line_spacing added above the ruled line as top-of-strip
-        margin (default 0.12).
-    strip_pad_below : float
-        Fraction of line_spacing added below the ruled line as bottom-of-strip
-        margin (default 0.80).
+        Full BGR (or grayscale) image of the scanned page.
+    roi_bbox : tuple[int, int, int, int]
+        Text ROI bounding box (x0, y0, x1, y1) in image pixel coordinates.
+    engines : list[str] | None
+        Restrict to specific engine names.  ``None`` = all available.
+        Valid names: 'tesseract', 'rysocr', 'easyocr', 'trocr', 'doctr',
+                     'rapidocr', 'paddleocr'.
+    enhancements : list[str] | None
+        Restrict to specific enhancement names.  ``None`` = all.
+        Valid names: 'raw', 'denoised', 'contrast_stretched', 'clahe',
+                     'adaptive_bin', 'upscaled_sharp'.
+    mark_threshold : float
+        Minimum Polish coverage score for the result to be non-empty.
+        Default 0.0 always returns the best candidate found.
+    apply_dictionary_correction : bool
+        When True (default), apply the Levenshtein dictionary corrector to the
+        merged text and populate ``OCRAnalysis.corrected_text``.
 
     Returns
     -------
-    list[LineResult]
-        One entry per line in order; each carries ``code_name``, ``line_index``,
-        ``bbox``, ``roi`` (ndarray), and ``text``.
+    OCRAnalysis
+        ``.merged_text``      – best-scoring raw text (alphabet-filtered)
+        ``.corrected_text``   – dictionary-corrected version of merged_text
+        ``.roi_bbox``         – ROI bbox passed in
+        ``.engine_results``   – all EngineResult objects
+        ``.best_engine``      – engine that produced the winning candidate
+        ``.best_enhancement`` – enhancement that produced the winning candidate
+        ``.polish_score``     – heuristic score of the merged text
 
     Raises
     ------
-    RuntimeError
-        When ``qr_bbox`` is None and no QR code can be found in the image.
+    ValueError
+        If ``roi_bbox`` is degenerate (zero width or height).
     """
-    # ── 1. Resolve QR position ────────────────────────────────────────────────
-    if qr_bbox is None:
-        hit = _detect_qr(image)
-        if hit is None:
-            raise RuntimeError("No QR code detected. Supply qr_bbox manually.")
-        qr_payload, qr_bbox = hit
-    if qr_payload is None:
-        qr_payload = "unknown"
+    x0, y0, x1, y1 = roi_bbox
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError(f"Degenerate roi_bbox: {roi_bbox}")
 
-    qx1, qy1, qx2, qy2 = qr_bbox
-    qr_side_px = avg_qr_size_px if avg_qr_size_px is not None else (qx2 - qx1)
-
-    # ── 2. Derive DPI and unit converters from QR size ────────────────────────
-    dpi    = qr_side_px / _QR_SIZE_MM * 25.4
-    mm2px  = dpi / 25.4
-    pt2px  = dpi / 72.0
-
-    # ── 3. Locate outer answer box ────────────────────────────────────────────
-    box_x1, box_y1, box_x2, box_y2 = _find_outer_box(image)
     img_h, img_w = image.shape[:2]
+    roi = image[max(0, y0): min(img_h, y1), max(0, x0): min(img_w, x1)]
 
-    # ── 4. Compute line y-positions using the PDF formula ─────────────────────
-    # PDF: qr_y = y_box_top - qr_size - 1pt  →  y_box_top(img) = qr_y1 - 1pt
-    y_box_top_img = qy1 - int(round(1.0 * pt2px))
-    box_h_px      = int(round(_BOX_H_MM * mm2px))
-    y_box_bot_img = y_box_top_img + box_h_px
+    active_enhancements = [
+        (name, fn) for name, fn in _ENHANCEMENTS
+        if enhancements is None or name in enhancements
+    ]
+    active_runners = [
+        (name, fn) for name, fn in _ENGINE_RUNNERS
+        if engines is None or name in engines
+    ]
 
-    line_spacing_px = _LINE_STEP_PT * pt2px
-    first_line_y    = (y_box_top_img
-                       + int(round(_FIRST_LINE_MM * mm2px))
-                       + int(round(_LINE_STEP_PT * pt2px)))
+    all_results: list[EngineResult] = []
+    for enh_name, enh_fn in active_enhancements:
+        try:
+            enhanced = enh_fn(roi)
+        except Exception:
+            continue
+        for _eng_name, runner in active_runners:
+            try:
+                all_results.extend(runner(enhanced, enh_name))
+            except Exception:
+                pass
 
-    line_ys: list[int] = []
-    ly = first_line_y
-    while len(line_ys) < n_lines and ly < y_box_bot_img:
-        line_ys.append(int(round(ly)))
-        ly += line_spacing_px
+    merged_text, best_engine, best_enhancement, polish_score = _merge_candidates(all_results)
 
-    # ── 5. Horizontal margins ─────────────────────────────────────────────────
-    left_pad_x    = qx2 + int(round(_LEFT_PAD_PT * pt2px))
-    left_margin_x = box_x1 + int(round(_LEFT_MARGIN_MM * mm2px))
-    right_margin_x = box_x2 - int(round(_RIGHT_MARGIN_MM * mm2px))
+    if polish_score < mark_threshold:
+        merged_text = ""
 
-    # ── 6. Extract and OCR each strip ─────────────────────────────────────────
-    results: list[LineResult] = []
-    pad_above_px = int(line_spacing_px * strip_pad_above)
-    pad_below_px = int(line_spacing_px * strip_pad_below)
+    corrected_text = _correct_text(merged_text) if apply_dictionary_correction else merged_text
 
-    for i, ruled_y in enumerate(line_ys):
-        y_top = max(box_y1, ruled_y - pad_above_px)
-        y_bot = min(box_y2, ruled_y + pad_below_px)
-
-        # Lines that vertically overlap the QR code start after it
-        x_left = left_pad_x if ruled_y <= qy2 + 5 else left_margin_x
-        x_left  = max(0, x_left)
-        x_right = min(img_w, right_margin_x)
-
-        roi  = image[y_top:y_bot, x_left:x_right]
-        text = _ocr_line(roi, lang=lang) if roi.size > 0 else ""
-
-        results.append(LineResult(
-            code_name=qr_payload,
-            line_index=i + 1,
-            bbox=(x_left, y_top, x_right, y_bot),
-            roi=roi,
-            text=text,
-        ))
-
-    return results
+    return OCRAnalysis(
+        merged_text=merged_text,
+        corrected_text=corrected_text,
+        roi_bbox=roi_bbox,
+        engine_results=all_results,
+        best_engine=best_engine,
+        best_enhancement=best_enhancement,
+        polish_score=polish_score,
+    )
 
 
 # ── Debug visualisation ───────────────────────────────────────────────────────
 
-def draw_line_debug(
+def draw_ocr_debug(
     image: np.ndarray,
-    lines: list[LineResult],
-    qr_bbox: tuple[int, int, int, int],
+    analysis: OCRAnalysis,
     *,
-    colour_strip: tuple[int, int, int] = (0, 200, 0),
-    colour_qr:    tuple[int, int, int] = (0, 120, 255),
-    thickness: int = 1,
+    colour_roi:   tuple[int, int, int] = (0, 180, 0),
+    colour_text:  tuple[int, int, int] = (0, 0, 200),
+    colour_label: tuple[int, int, int] = (0, 140, 0),
+    colour_bg:    tuple[int, int, int] = (255, 255, 240),
+    thickness: int = 2,
+    font_scale: float = 0.45,
 ) -> np.ndarray:
-    """Return annotated copy of *image* showing QR and strip bboxes."""
-    out = image.copy()
-    qx1, qy1, qx2, qy2 = qr_bbox
-    cv2.rectangle(out, (qx1, qy1), (qx2, qy2), colour_qr, 2)
-    cv2.putText(out, lines[0].code_name if lines else "QR",
-                (qx1, qy1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour_qr, 1)
-    for ln in lines:
-        x1, y1, x2, y2 = ln.bbox
-        cv2.rectangle(out, (x1, y1), (x2, y2), colour_strip, thickness)
-        label = f"L{ln.line_index}: {ln.text[:40]}" if ln.text else f"L{ln.line_index}"
-        cv2.putText(out, label, (x1 + 4, y1 + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, colour_strip, 1)
+    """
+    Return a copy of *image* with the ROI bbox and OCR result annotated.
+
+    Annotations
+    -----------
+    Green rectangle  – ROI bounding box
+    Green label      – engine, enhancement, and Polish score (above ROI)
+    Blue banner      – corrected_text (wrapped, tinted background below ROI)
+
+    Parameters match the style of ``draw_checkbox_debug`` in checkbox_analyzer.py.
+    """
+    out = image.copy() if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+    x0, y0, x1, y1 = analysis.roi_bbox
+    cv2.rectangle(out, (x0, y0), (x1, y1), colour_roi, thickness)
+
+    label   = (f"engine={analysis.best_engine}  "
+               f"enh={analysis.best_enhancement}  "
+               f"score={analysis.polish_score:.3f}")
+    label_y = max(y0 - 6, 14)
+    cv2.putText(out, label, (x0, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.85, colour_label, 1, cv2.LINE_AA)
+
+    display_text = analysis.corrected_text or analysis.merged_text
+    if display_text:
+        max_chars = 65
+        wrapped: list[str] = []
+        for raw_line in display_text.split("\n"):
+            current = ""
+            for word in raw_line.split():
+                if len(current) + len(word) + 1 > max_chars:
+                    if current:
+                        wrapped.append(current)
+                    current = word
+                else:
+                    current = (current + " " + word).strip()
+            if current:
+                wrapped.append(current)
+
+        line_h   = int(20 * font_scale / 0.45)
+        banner_h = line_h * len(wrapped) + 8
+        bx0, by0 = x0, y1 + 4
+        bx1, by1 = min(out.shape[1], x0 + 720), by0 + banner_h
+
+        if by1 <= out.shape[0] and bx1 <= out.shape[1] and by0 >= 0:
+            sub = out[by0:by1, bx0:bx1]
+            bg  = np.full_like(sub, colour_bg)
+            cv2.addWeighted(bg, 0.55, sub, 0.45, 0, sub)
+            out[by0:by1, bx0:bx1] = sub
+
+        for i, line in enumerate(wrapped):
+            ly = by0 + line_h * (i + 1)
+            if ly >= out.shape[0]:
+                break
+            cv2.putText(out, line, (bx0 + 4, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                        colour_text, 1, cv2.LINE_AA)
+
+    return out
+
+
+def draw_multi_ocr_debug(
+    image: np.ndarray,
+    analyses: list[OCRAnalysis],
+    *,
+    colours: Optional[list[tuple[int, int, int]]] = None,
+    thickness: int = 2,
+    font_scale: float = 0.45,
+) -> np.ndarray:
+    """
+    Annotate multiple OCR analyses on a single debug image.
+
+    Cycles through *colours* (6 defaults) when more analyses are provided.
+    """
+    _default_colours: list[tuple[int, int, int]] = [
+        (0, 180, 0),
+        (200, 100, 0),
+        (0, 0, 200),
+        (180, 0, 180),
+        (0, 180, 180),
+        (180, 180, 0),
+    ]
+    if colours is None:
+        colours = _default_colours
+
+    out = image.copy() if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    for i, analysis in enumerate(analyses):
+        colour = colours[i % len(colours)]
+        out = draw_ocr_debug(
+            out, analysis,
+            colour_roi=colour,
+            colour_text=colour,
+            colour_label=colour,
+            thickness=thickness,
+            font_scale=font_scale,
+        )
     return out
 
 
@@ -290,33 +1062,53 @@ def draw_line_debug(
 if __name__ == "__main__":
     import sys, pathlib
 
-    if len(sys.argv) < 2:
-        print("Usage: python extract_part_b.py <image_path> [avg_qr_size_px]")
+    usage = (
+        "Usage: python text_extractor.py <image> <x0> <y0> <x1> <y1> "
+        "[engine,...] [enhancement,...]\n"
+        "  x0 y0 x1 y1       = ROI bounding box in image pixels\n"
+        "  engine,...         = comma-separated engine names (optional, default=all)\n"
+        "  enhancement,...    = comma-separated enhancement names (optional, default=all)\n"
+        "\nAvailable engines:\n"
+        "  tesseract (primary/default), rysocr, easyocr, trocr, doctr, "
+        "rapidocr, paddleocr\n"
+        "Available enhancements:\n"
+        "  raw, denoised, contrast_stretched, clahe, adaptive_bin, upscaled_sharp\n"
+    )
+    if len(sys.argv) < 6:
+        print(usage)
         sys.exit(1)
 
-    path         = sys.argv[1]
-    avg_qr_size  = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    img_path = sys.argv[1]
+    bbox     = tuple(int(v) for v in sys.argv[2:6])   # type: ignore[assignment]
+    eng_arg  = sys.argv[6].split(",") if len(sys.argv) > 6 else None
+    enh_arg  = sys.argv[7].split(",") if len(sys.argv) > 7 else None
 
-    img = cv2.imread(path)
+    img = cv2.imread(img_path)
     if img is None:
-        sys.exit(f"Cannot read: {path}")
+        sys.exit(f"Cannot read image: {img_path}")
 
-    lines = extract_part_b_lines(img, avg_qr_size_px=avg_qr_size)
+    analysis = extract_text_from_bbox(img, bbox, engines=eng_arg, enhancements=enh_arg)
 
-    print(f"Code : {lines[0].code_name if lines else '?'}")
-    print()
-    for ln in lines:
-        print(f"  Line {ln.line_index}  bbox={ln.bbox}")
-        print(f"    text : {ln.text!r}")
-        roi_path = pathlib.Path(path).with_stem(
-            pathlib.Path(path).stem + f"_line{ln.line_index}"
+    print(f"ROI bbox         : {analysis.roi_bbox}")
+    print(f"Best engine      : {analysis.best_engine}")
+    print(f"Best enhancement : {analysis.best_enhancement}")
+    print(f"Polish score     : {analysis.polish_score:.4f}")
+    print(f"Merged text      :\n  {analysis.merged_text}")
+    print(f"Corrected text   :\n  {analysis.corrected_text}")
+
+    if analysis.engine_results:
+        print(f"\nTop 10 candidates (of {len(analysis.engine_results)} total):")
+        ranked = sorted(
+            analysis.engine_results,
+            key=lambda e: _polish_coverage(_filter_to_alphabet(e.text)),
+            reverse=True,
         )
-        cv2.imwrite(str(roi_path), ln.roi)
+        for er in ranked[:10]:
+            preview = _filter_to_alphabet(er.text)[:70].replace("\n", "↵")
+            score   = _polish_coverage(_filter_to_alphabet(er.text))
+            print(f"  [{score:.3f}] {er.engine:35s} ({er.enhancement:20s}): {preview!r}")
 
-    # Debug overlay
-    qr_hit = _detect_qr(img)
-    if qr_hit:
-        debug = draw_line_debug(img, lines, qr_hit[1])
-        dbg_path = pathlib.Path(path).with_stem(pathlib.Path(path).stem + "_debug")
-        cv2.imwrite(str(dbg_path), debug)
-        print(f"\nDebug image → {dbg_path}")
+    debug    = draw_ocr_debug(img, analysis)
+    out_path = pathlib.Path(img_path).with_stem(pathlib.Path(img_path).stem + "_ocr_debug")
+    cv2.imwrite(str(out_path), debug)
+    print(f"\nDebug image saved → {out_path}")
