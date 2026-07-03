@@ -11,6 +11,7 @@ from tools.polish_ocr2 import recognize_handwritten_polish
 from tools.checkbox_analyzer import analyse_checkboxes, draw_checkbox_debug
 from tools.image_tools import rectify_image
 from tools.qrcode_tools import decode_qrcodes
+from tools.qwen_recognition import recognize_handwriting
 
 
 class SingleResult:
@@ -124,8 +125,8 @@ def set_part_b(self, part_b_answers):
     pass
 
 
-INPUT_FOLDER = Path("./sample")
-OUTPUT_EXCEL = "wyniki_ankiet.xlsx"
+INPUT_FOLDER = Path("./ankiety_2025_26_zima_sem_1")
+OUTPUT_FOLDER = Path("./wyniki")
 
 
 def analyze_surveys():
@@ -150,7 +151,7 @@ def analyze_surveys():
         except Exception as e:
             print(f"✗ Błąd przy przetwarzaniu {pdf_file.name}: {str(e)}")
         print(f"Running {pdf_file.name} to Excel file")
-        build_excel(respondents=pdf_list, output_path=pdf_file.name+'.xlsx')
+        build_excel(respondents=pdf_list, output_path=str(OUTPUT_FOLDER.joinpath(pdf_file.name+'.xlsx')))
     return True
 
 
@@ -194,13 +195,15 @@ def analyse_content(page_img: np.ndarray, debug: bool = False):
                          h - int(0.75 * avg_px)
 
         text_box = cv_right_img[frame_bbox[1]:frame_bbox[3], frame_bbox[0]:frame_bbox[2], :]
-        r = ''
-        r = recognize_handwritten_polish(text_box)
+        try:
+            print("Trying qwen")
+            r = recognize_handwriting(text_box)
+        except Exception as e:
+            print("Qwen not work, using tesseract")
+            r = recognize_handwritten_polish(text_box)
         key = 'b'+code_0.payload[-1]
         final_b_codes[key] = (r, text_box)
-
         if debug:
-            # image = Image.fromarray(drawing_copy_right)
             image = Image.fromarray(drawing_copy)
             image.show('Image')
 
