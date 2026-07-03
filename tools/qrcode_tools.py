@@ -43,6 +43,7 @@ try:
     from pyzbar.pyzbar import decode as _pyzbar_decode
     HAS_PYZBAR = True
 except ImportError:
+    print('There is no pyzbar module installed.')
     HAS_PYZBAR = False
 
 try:
@@ -51,6 +52,7 @@ try:
     _zxingcpp.Binarizer.LocalAverage  # raises AttributeError on older versions
     HAS_ZXINGCPP = True
 except (ImportError, AttributeError):
+    print('There is no zxingcpp module installed.')
     HAS_ZXINGCPP = False
 
 try:
@@ -58,6 +60,7 @@ try:
     _qreader_instance: Optional[_QReader] = None   # lazy singleton
     HAS_QREADER = True
 except ImportError:
+    print('There is no qreader module installed.')
     HAS_QREADER = False
 
 

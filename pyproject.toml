@@ -1,8 +1,8 @@
 [project]
-name = "pythonproject1"
+name = "StudentsArtifacts"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "opencv-python",
     "pytesseract",
@@ -20,5 +20,15 @@ dependencies = [
     "matplotlib>=3.10.8",
     "tqdm>=4.67.3",
     "natural-pdf>=0.6.2",
+    "peft>=0.19.1",
+    "rapidocr>=3.8.1",
+    "qreader>=3.16",
+    "einops>=0.8.2",
+    "torch>=2.12.0",
+    "transformers>=4.40.0",
+    "qwen-vl-utils>=0.0.14",
+    "accelerate>=1.13.0",
+    "safetensors>=0.7.0",
+    "zxing-cpp>=3.0.0",
 ]
 
