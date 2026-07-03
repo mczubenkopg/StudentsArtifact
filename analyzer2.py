@@ -199,6 +199,7 @@ def analyse_content(page_img: np.ndarray, debug: bool = False):
             print("Trying qwen")
             r = recognize_handwriting(text_box)
         except Exception as e:
+            print(e)
             print("Qwen not work, using tesseract")
             r = recognize_handwritten_polish(text_box)
         key = 'b'+code_0.payload[-1]
