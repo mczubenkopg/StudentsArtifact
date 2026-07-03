@@ -12,8 +12,6 @@ from tools.checkbox_analyzer import analyse_checkboxes, draw_checkbox_debug
 from tools.image_tools import rectify_image
 from tools.qrcode_tools import decode_qrcodes
 
-access_token = "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"
-
 
 class SingleResult:
     part_a_texts = {
